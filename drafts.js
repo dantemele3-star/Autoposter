@@ -1,4 +1,5 @@
 const { clickElement, navigate, settle, dismissPopup } = require('./listing-controls');
+const { paceAction } = require('./pacing');
 
 const PAGE_SIZE = 50;
 const draftUrl = page => `https://gameflip.com/listings/draft?page=${page}&limit=${PAGE_SIZE}`;
@@ -111,13 +112,20 @@ async function openDraft(page, draft, log, stopped = () => false) {
     if (stopped()) return false;
     if (!current) throw new Error(`The draft from scanned page ${draft.page}, row ${draft.index + 1} is no longer available. No other draft was selected.`);
     await dismissPopup(page);
+    await paceAction(page);
+    current = (await snapshot(page)).rows.find(row => row.key === draft.key);
+    if (!current) throw new Error('The selected draft moved while the page was settling. No other draft was selected.');
     const buttons = await page.$$('.tool-duplicate');
     try {
         const button = buttons[current.index];
         if (!button || (await page.evaluate(draftRows, button))[0].key !== draft.key) {
             throw new Error('The selected draft changed before it could be opened.');
         }
-        await clickElement(page, button, { useMouse: true });
+        await clickElement(page, button, { useMouse: true, paced: true, verify: async () => {
+            if ((await page.evaluate(draftRows, button))[0].key !== draft.key) {
+                throw new Error('The selected draft changed during the action pause.');
+            }
+        } });
     } finally {
         await Promise.all(buttons.map(button => button.dispose()));
     }

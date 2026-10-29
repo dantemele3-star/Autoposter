@@ -5,10 +5,11 @@ const fs = require('fs');
 const os = require('os');
 
 const {
-    listingId, clickControl, waitForControl, navigate, dismissPopup,
-    deleteOldestListing, waitForPublished, settle
+    clickControl, waitForControl, navigate, dismissPopup,
+    deleteOldestListing, capturePublication, waitForPublished, settle
 } = require('./listing-controls');
 const { scanDrafts, openDraft } = require('./drafts');
+const { PostingBudget, DAILY_LIMIT } = require('./posting-budget');
 
 let shouldStop = false;
 let isRunning = false;
@@ -20,13 +21,23 @@ async function waitBetweenPosts(ms) {
     }
 }
 
+async function waitForPostingSlot(win, budget) {
+    const { waitMs } = budget.status();
+    if (waitMs > 0 && !shouldStop) {
+        sendLog(win, `⏳ Rate Limit Protection: ${Math.ceil(waitMs / 1000)}s remain in the 220-second minimum posting interval...`);
+        await waitBetweenPosts(waitMs);
+    }
+    return !shouldStop;
+}
+
 function sendLog(win, message) {
     if (win && !win.isDestroyed()) {
         win.webContents.send('log-message', message);
     }
 }
 
-async function processDrafts(win, config) {
+async function processDrafts(win, config, budget) {
+    if (!await waitForPostingSlot(win, budget)) return { success: true, postedCount: 0 };
     const sessionPath = process.platform === 'win32'
         ? path.join(os.homedir(), 'AppData', 'Local', 'Gameflip_Ghost_Session')
         : path.join(app.getPath('userData'), 'Gameflip_Ghost_Session');
@@ -54,12 +65,13 @@ async function processDrafts(win, config) {
     const pages = await browser.pages();
     const page = pages.length > 0 ? pages[0] : await browser.newPage();
 
-    page.setDefaultTimeout(15000);
+    page.setDefaultTimeout(30000);
     let postedCount = 0;
 
     try {
         sendLog(win, "\n--- 👻 GHOST SESSION STARTED ---");
         sendLog(win, `Mode: ${config.headless ? 'Headless (Hidden)' : 'Headed (Visible)'}`);
+        sendLog(win, `Tracked app submissions in the last 24 hours: ${budget.status().count}/${DAILY_LIMIT}. Browser actions are spaced by at least 2 seconds.`);
         sendLog(win, "Navigating to Gameflip Drafts...");
         await navigate(page, 'https://gameflip.com/listings/draft');
 
@@ -94,6 +106,7 @@ async function processDrafts(win, config) {
                 break;
             }
 
+            if (!await waitForPostingSlot(win, budget)) break;
             const item = processingQueue[i];
             sendLog(win, `\n📦 Processing Item ${i + 1}/${processingQueue.length} (Scanned page ${item.page}, row ${item.index + 1})...`);
 
@@ -108,25 +121,29 @@ async function processDrafts(win, config) {
             sendLog(win, 'Waiting for List Item in the listing preview...');
             const listReady = await waitForControl(page, 'list');
             await listReady.dispose();
-            const draftId = listingId(page.url());
-            sendLog(win, 'Submitting the listing...');
-            await clickControl(page, 'list');
-            const publishedId = await waitForPublished(page, draftId);
-
-            postedCount++;
-            sendLog(win, ` ✨ Item processed successfully.`);
-
-            if (config.maintainLimit) {
-                await deleteOldestListing(page, message => sendLog(win, message), publishedId);
+            let publication;
+            let recorded = false;
+            try {
+                sendLog(win, 'Submitting the listing; confirmation may take up to 90 seconds...');
+                await clickControl(page, 'list', { beforeClick: async () => {
+                    publication = await capturePublication(page);
+                    const count = budget.reserve();
+                    recorded = true;
+                    sendLog(win, `Submission recorded: ${count}/${DAILY_LIMIT} in the last 24 hours.`);
+                } });
+                const publishedId = await waitForPublished(page, publication, { log: message => sendLog(win, message) });
+                postedCount++;
+                sendLog(win, '✅ Publication confirmed.');
+                if (config.maintainLimit) {
+                    if (!publishedId) throw new Error('Publication succeeded, but its ID could not be identified. Count maintenance paused; nothing was deleted.');
+                    await deleteOldestListing(page, message => sendLog(win, message), publishedId);
+                }
+            } finally {
+                if (recorded) budget.finishAttempt();
             }
 
-            const minDelay = 220000;
-            const randomBuffer = Math.floor(Math.random() * 20000);
-            const totalDelay = minDelay + randomBuffer;
-
             if ((i < processingQueue.length - 1 || config.loop) && !shouldStop) {
-                sendLog(win, `⏳ Rate Limit Protection: Waiting ${Math.round(totalDelay/1000)}s until next post...`);
-                await waitBetweenPosts(totalDelay);
+                await waitForPostingSlot(win, budget);
             }
 
         }
@@ -135,7 +152,7 @@ async function processDrafts(win, config) {
         sendLog(win, `Total successfully posted in this cycle: ${postedCount}`);
         return { success: true, postedCount };
     } catch (err) {
-        sendLog(win, `❌ CRITICAL ERROR: ${err.message}`);
+        sendLog(win, `⚠️ Posting paused: ${err.message}`);
         err.postedCount = postedCount;
         throw err;
     } finally {
@@ -151,8 +168,9 @@ ipcMain.handle('process-drafts', async (event, config = {}) => {
     shouldStop = false;
     let totalPosted = 0;
     try {
+        const budget = new PostingBudget(path.join(app.getPath('userData'), 'posting-history.json'), { now: () => Date.now() });
         do {
-            const result = await processDrafts(win, config);
+            const result = await processDrafts(win, config, budget);
             totalPosted += result.postedCount;
             if (!config.loop || shouldStop) break;
             sendLog(win, '♻️ Loop enabled. Restarting in 30 seconds...');
@@ -172,7 +190,9 @@ ipcMain.handle('stop-drafts', async () => {
     return { success: true };
 });
 
-app.whenReady().then(() => {
+if (!app.requestSingleInstanceLock()) {
+    app.quit();
+} else app.whenReady().then(() => {
     const win = new BrowserWindow({
         width: 900,
         height: 800,

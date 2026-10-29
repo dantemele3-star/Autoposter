@@ -1,3 +1,6 @@
+const { paceAction, completeAction } = require('./pacing');
+const { CONFIRMATION_TIMEOUT_MS } = require('./posting-budget');
+
 const ORIGIN = 'https://gameflip.com';
 const ON_SALE = `${ORIGIN}/listings/onsale`;
 
@@ -5,7 +8,14 @@ function listingId(url) {
     try {
         const parsed = new URL(url);
         if (parsed.origin !== ORIGIN) return null;
-        return parsed.pathname.match(/(?:^|\/)([a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12})(?:\/|$)/i)?.[1]?.toLowerCase() || null;
+        const uuid = '[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}';
+        const pathId = parsed.pathname.match(new RegExp(`(?:^|/)(${uuid})(?:/|$)`, 'i'))?.[1];
+        if (pathId) return pathId.toLowerCase();
+        for (const name of ['id', '_id', 'listing', 'listingId', 'listing_id']) {
+            const value = parsed.searchParams.get(name);
+            if (value && new RegExp(`^${uuid}$`, 'i').test(value)) return value.toLowerCase();
+        }
+        return null;
     } catch {
         return null;
     }
@@ -50,20 +60,27 @@ async function parkPointer(page) {
     await page.mouse.move(1, Math.max(1, height - 1));
 }
 
-async function clickElement(page, element, { useMouse = false } = {}) {
+async function clickElement(page, element, { useMouse = false, verify, beforeClick, paced = false } = {}) {
+    if (!paced) await paceAction(page);
+    if (verify) await verify();
     await parkPointer(page);
     const handle = await element.evaluateHandle(el => el.closest('a, button, input, [role="button"]') ||
         el.querySelector('a, button, input, [role="button"]') || el);
     try {
+        if (!await handle.evaluate(el => el.isConnected && !el.disabled && el.getAttribute('aria-disabled') !== 'true')) {
+            throw new Error('The action control changed or became disabled before it could be clicked.');
+        }
         await handle.evaluate(el => {
             el.scrollIntoView({ block: 'center', behavior: 'instant' });
             const link = el.closest('a');
             if (link) link.target = '_self';
         });
+        if (beforeClick) await beforeClick();
         if (useMouse) await handle.asElement().click();
         else await handle.evaluate(el => el.click());
     } finally {
         await handle.dispose();
+        completeAction(page);
     }
 }
 
@@ -80,10 +97,11 @@ async function waitForControl(page, action) {
     }
 }
 
-async function clickControl(page, action) {
+async function clickControl(page, action, options) {
+    await paceAction(page);
     const handle = await waitForControl(page, action);
     try {
-        await clickElement(page, handle.asElement());
+        await clickElement(page, handle.asElement(), { ...options, paced: true });
     } finally {
         await handle.dispose();
     }
@@ -94,17 +112,24 @@ async function settle(page) {
 }
 
 async function navigate(page, url) {
+    await paceAction(page);
     const response = await page.goto(url, { waitUntil: 'domcontentloaded' });
     await parkPointer(page);
     await settle(page);
+    completeAction(page);
     return response;
 }
 
 async function dismissPopup(page) {
+    const initial = await page.evaluateHandle(findControl, 'dismiss');
+    const present = Boolean(initial.asElement());
+    await initial.dispose();
+    if (!present) return;
+    await paceAction(page);
     const handle = await page.evaluateHandle(findControl, 'dismiss');
     try {
         if (handle.asElement()) {
-            await clickElement(page, handle.asElement());
+            await clickElement(page, handle.asElement(), { paced: true });
             await settle(page);
         }
     } finally {
@@ -169,28 +194,93 @@ async function deleteOldestListing(page, log, publishedId) {
     log('✅ Oldest listing deletion verified.');
 }
 
-async function waitForPublished(page, draftId) {
-    const result = await page.waitForFunction(expectedId => {
-        const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
-        if ([...document.querySelectorAll('button')].some(el => visible(el) && /^list item$/i.test(el.textContent.trim()))) return false;
-        const itemPage = /^\/item\//.test(location.pathname) && !/\/(edit|preview|sell)(?:\/|$)/.test(location.pathname);
-        const onSale = location.pathname === '/listings/onsale' && expectedId &&
-            [...document.querySelectorAll('a[href]')].some(el => visible(el) && el.href.includes(expectedId));
-        const success = [...document.querySelectorAll('.alert-success, [role="status"]')]
-            .some(el => visible(el) && /(?:listed|published|now live|on sale)/i.test(el.textContent));
-        return itemPage || onSale || success;
-    }, {}, draftId).catch(error => {
+// Runs in Chrome for both the pre-click snapshot and publication observation.
+function publicationDOM(context, control) {
+    const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden';
+    const text = el => (el.innerText || el.value || el.textContent).trim().replace(/\s+/g, ' ').slice(0, 1000);
+    const receipts = [...document.querySelectorAll('.alert-success, [role="status"], [role="alert"], .modal, [role="dialog"], .toast')]
+        .filter(visible).filter(el => {
+            const value = text(el);
+            return /\b(?:successfully\s+(?:listed|published)|(?:item|listing)\b.{0,80}\b(?:listed|published|now live|on sale))\b/i.test(value) &&
+                !/\b(?:not\s+(?:listed|published|live|on sale)|failed|unable|cannot|error)\b/i.test(value);
+        }).map(el => ({ text: text(el), links: [...el.querySelectorAll('a[href]')].map(a => a.href) }));
+    if (context.capture) {
+        const form = control?.closest('form');
+        const root = form || document;
+        const selectors = '[data-listing-id], input[name="listing_id"], input[name="listingId"], input[name="_id"]' +
+            (form ? ', input[name="id"]' : '');
+        return { before: receipts.map(receipt => receipt.text), candidates: [
+            form?.action, form?.getAttribute('data-listing-id'),
+            ...[...root.querySelectorAll(selectors)].map(el => el.getAttribute('data-listing-id') || el.value)
+        ].filter(Boolean) };
+    }
+    const fresh = receipts.find(receipt => !(context.before || []).includes(receipt.text));
+    if (fresh) return { kind: 'receipt', links: fresh.links };
+    if (/^\/item\//.test(location.pathname) && !/\/(edit|preview|sell)(?:\/|$)/.test(location.pathname)) {
+        return { kind: 'item', url: location.href };
+    }
+    if (location.pathname.replace(/\/$/, '') === '/listings/onsale') return { kind: 'onsale' };
+    const rejected = [...document.querySelectorAll('.alert-danger, .alert-error, [role="alert"]')]
+        .some(el => visible(el) && /\b(?:error|rejected|failed|unable|limit reached)\b/i.test(text(el)));
+    return rejected ? { kind: 'error' } : false;
+}
+
+async function capturePublication(page) {
+    const control = await waitForControl(page, 'list');
+    let snapshot;
+    try {
+        snapshot = await page.evaluate(publicationDOM, { capture: true }, control.asElement());
+    } finally {
+        await control.dispose();
+    }
+    const uuid = /^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i;
+    const ids = [...new Set(snapshot.candidates.map(value => uuid.test(value) ? value.toLowerCase() : listingId(value)).filter(Boolean))];
+    return { id: listingId(page.url()) || (ids.length === 1 ? ids[0] : null), before: snapshot.before };
+}
+
+async function findPostedOnSale(page, id, deadline) {
+    const seen = new Set();
+    for (let number = 1; ; number++) {
+        const response = await navigate(page, `${ON_SALE}?page=${number}&limit=50`);
+        if ((response && !response.ok()) || new URL(page.url()).pathname.replace(/\/$/, '') !== '/listings/onsale') return false;
+        const ids = [...new Set((await activeListingLinks(page)).map(listingId))];
+        if (ids.includes(id)) return true;
+        const signature = JSON.stringify(ids);
+        if (ids.length < 50 || seen.has(signature) || Date.now() >= deadline) return false;
+        seen.add(signature);
+    }
+}
+
+async function waitForPublished(page, context, {
+    timeoutMs = CONFIRMATION_TIMEOUT_MS, retryDelayMs = 5000,
+    sleep = ms => new Promise(resolve => setTimeout(resolve, ms)), log = () => {}
+} = {}) {
+    if (typeof context === 'string' || !context) context = { id: context, before: [] };
+    const deadline = Date.now() + timeoutMs;
+    let state;
+    try {
+        const result = await page.waitForFunction(publicationDOM, { timeout: timeoutMs, polling: 250 }, context);
+        try { state = await result.jsonValue(); } finally { await result.dispose(); }
+    } catch (error) {
         if (error.name !== 'TimeoutError') throw error;
-        throw new Error('List Item was clicked, but publication was not confirmed. Check Gameflip before restarting; no deletion was attempted.');
-    });
-    await result.dispose();
-    await settle(page);
-    const id = listingId(page.url()) || draftId;
-    if (!id) throw new Error('Could not identify the published listing; posting paused.');
-    return id;
+        state = { kind: 'timeout' };
+    }
+    const receiptIds = (state.links || []).map(listingId).filter(Boolean);
+    const id = listingId(state.url) || (new Set(receiptIds).size === 1 ? receiptIds[0] : null) || context.id;
+    if (!id) {
+        if (state.kind === 'receipt') return null; // Explicit success; count it, but do not guess an ID for deletion.
+        throw new Error('On Sale/publication was reached without an identifiable copied listing ID. The submission may have posted; check Gameflip before restarting. No deletion was attempted.');
+    }
+    log('Verifying the submitted listing in On Sale (without submitting it again)...');
+    do {
+        if (await findPostedOnSale(page, id, Math.max(deadline, Date.now() + 10000))) return id;
+        if (state.kind === 'error' || Date.now() >= deadline) break;
+        await sleep(Math.min(retryDelayMs, deadline - Date.now()));
+    } while (Date.now() < deadline);
+    throw new Error('The submission was recorded, but the listing could not be verified in On Sale. It may have posted; check Gameflip before restarting. No retry or deletion was attempted.');
 }
 
 module.exports = {
     listingId, findControl, clickElement, clickControl, waitForControl, navigate, dismissPopup,
-    deleteOldestListing, waitForPublished, settle
+    deleteOldestListing, capturePublication, waitForPublished, settle
 };

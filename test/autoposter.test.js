@@ -3,9 +3,12 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
+const os = require('node:os');
 const puppeteer = require('puppeteer');
 const controls = require('../listing-controls');
 const drafts = require('../drafts');
+const { ActionPacer, setPagePacer } = require('../pacing');
+const budgets = require('../posting-budget');
 
 const OLD = '11111111-1111-4111-8111-111111111111';
 const RECENT = '22222222-2222-4222-8222-222222222222';
@@ -13,6 +16,7 @@ const NEW = '33333333-3333-4333-8333-333333333333';
 const NEXT = '44444444-4444-4444-8444-444444444444';
 const itemUrl = id => `https://gameflip.com/item/example/${id}`;
 let browser, page, state;
+const stateFolders = [];
 
 before(async () => {
     browser = await puppeteer.launch({
@@ -23,10 +27,12 @@ before(async () => {
 });
 after(async () => browser?.close());
 beforeEach(async () => {
-    state = { listings: [RECENT, OLD], visits: [], requests: [], deleted: [], published: [], posts: 0, drafts: 1 };
+    state = { listings: [RECENT, OLD], visits: [], requests: [], deleted: [], published: [], timers: [], posts: 0, drafts: 1 };
     page = await browser.newPage();
-    const setTimeout = page.setDefaultTimeout.bind(page);
-    page.setDefaultTimeout = ms => setTimeout(Math.min(ms, 1500));
+    let actionClock = 0;
+    setPagePacer(page, new ActionPacer({ now: () => actionClock, sleep: async ms => { actionClock += ms; } }));
+    const setPageTimeout = page.setDefaultTimeout.bind(page);
+    page.setDefaultTimeout = ms => setPageTimeout(Math.min(ms, 1500));
     page.setDefaultTimeout(1500);
     await page.setRequestInterception(true);
     page.on('request', async request => {
@@ -41,7 +47,10 @@ beforeEach(async () => {
             if (!state.rejectPost) {
                 state.posts++;
                 state.published.push(url.searchParams.get('id'));
-                state.listings.unshift(url.searchParams.get('id'));
+                const currentState = state;
+                const activate = () => currentState.listings.unshift(url.searchParams.get('id'));
+                if (state.indexDelay) state.timers.push(global.setTimeout(activate, state.indexDelay));
+                else activate();
                 state.afterPost?.();
             }
             body = '{}';
@@ -56,7 +65,11 @@ beforeEach(async () => {
         await request.respond({ status: 200, contentType: url.pathname.startsWith('/fixture/') ? 'application/json' : 'text/html', body });
     });
 });
-afterEach(async () => page?.close());
+afterEach(async () => {
+    for (const timer of state.timers) clearTimeout(timer);
+    await page?.close();
+    for (const folder of stateFolders.splice(0)) fs.rmSync(folder, { recursive: true, force: true });
+});
 
 // Every browser request is intercepted. No account, cookie or Gameflip network
 // access is used; these fixtures reproduce the competing navigation/dropdowns.
@@ -71,7 +84,7 @@ function fixture(url) {
             ? `<div data-listing-id="${id}"><a href="/item/source/${id}">Source draft</a>
                 <span class="tool-duplicate"><button onpointerdown="window.pressed=true"
                     onclick="if(window.pressed) location.href='/listings/${id}/edit'">Copy</button></span></div>`
-            : `<a class="tool-duplicate" target="_blank" href="${state.sharedCopyLink ? '/listings/copy' : `/listings/${id}/edit` }"
+            : `<a class="tool-duplicate" target="_blank" href="${state.sharedCopyLink ? '/listings/copy' : state.queryEditor ? `/listing/edit?id=${id}` : `/listings/${id}/edit` }"
                 ${state.blockCopy ? 'onclick="event.preventDefault()"' : ''}>Create a copy in Draft</a>`).join('');
         if (state.pager === 'none') {
             content += '<section><button disabled>Next</button></section>';
@@ -86,18 +99,21 @@ function fixture(url) {
         }
         if (state.popup) content += '<div class="modal" role="dialog"><button onclick="this.parentElement.style.display=\'none\'">Not now</button></div>';
     } else if (url.pathname.endsWith('/edit')) {
+        const preview = state.queryEditor ? `/listing/preview?id=${id}` : `/listings/${id}/preview`;
         content = state.anchorDone
-            ? `<a class="btn" href="/listings/${id}/preview">Done</a>`
-            : `<button onclick="location.href='/listings/${id}/preview'">Done</button>`;
+            ? `<a class="btn" href="${preview}">Done</a>`
+            : `<button onclick="location.href='${preview}'">Done</button>`;
     } else if (url.pathname.endsWith('/preview')) {
         content = `<button onclick="fetch('/fixture/publish?id=${id}').then(() => {
-            ${state.rejectPost ? "document.querySelector('#error').textContent='Post rejected'" : `location.href='/item/example/${id}'`}
+            ${state.rejectPost ? "document.querySelector('#error').textContent='Post rejected'" : state.stayPreview
+                ? '' : state.publishToOnSale ? "location.href='/listings/onsale'" : `location.href='/item/example/${id}'`}
         })">List Item</button><div id="error" role="alert"></div>`;
     } else if (url.pathname === '/listings/onsale') {
-        content = `<div class="dropdown" id="sort">
+        const saleIds = state.salePages ? state.salePages[Number(url.searchParams.get('page') || 1) - 1] || [] : state.listings;
+        content = `${state.saleListButton ? '<button>List Item</button>' : ''}<div class="dropdown" id="sort">
             <button class="dropdown-toggle" onclick="this.parentElement.classList.toggle('open')">Created: Newest</button>
             <div class="dropdown-menu">${state.sortBroken ? '' : `<button onclick="sortOldest()">Oldest</button>`}</div>
-        </div><div id="rows">${links(state.listings)}</div>
+        </div><div id="rows">${links(saleIds)}</div>
         <script>
             async function sortOldest() {
                 document.querySelector('#sort button').textContent = 'Created: Oldest';
@@ -130,27 +146,33 @@ function links(ids) {
     return ids.map(id => `<a target="_blank" href="${itemUrl(id)}">Listing ${id}</a>`).join('');
 }
 
-function mainProcess({ random = Math.random, skipWaits = false } = {}) {
+function mainProcess({ random = Math.random, skipWaits = false, stateFolder } = {}) {
+    if (!stateFolder) {
+        stateFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'autoposter-state-test-'));
+        stateFolders.push(stateFolder);
+    }
     const handlers = new Map();
     const logs = [];
     const win = { isDestroyed: () => false, webContents: { send: (_, message) => logs.push(message) } };
     let closed = false;
     const fakeBrowser = { pages: async () => [page], close: async () => { closed = true; } };
     const electron = {
-        app: { getPath: () => '/tmp/autoposter-test', whenReady: () => ({ then() {} }) },
+        app: { getPath: () => stateFolder, whenReady: () => ({ then() {} }), requestSingleInstanceLock: () => true, quit() {} },
         BrowserWindow: { fromWebContents: () => win },
         ipcMain: { handle: (name, handler) => handlers.set(name, handler), on() {} }
     };
     let clock = Date.now();
     class TestClock extends Date { static now() { return clock += 300000; } }
+    const testingControls = { ...controls, waitForPublished: (target, context, options) =>
+        controls.waitForPublished(target, context, { ...options, timeoutMs: 1500, retryDelayMs: 50 }) };
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8'), {
         require: name => name === 'electron' ? electron : name === 'puppeteer'
-            ? { launch: async () => fakeBrowser } : name === './listing-controls' ? controls
-                : name === './drafts' ? drafts : require(name),
+            ? { launch: async () => fakeBrowser } : name === './listing-controls' ? testingControls
+                : name === './drafts' ? drafts : name === './posting-budget' ? budgets : require(name),
         process, console, setTimeout: global.setTimeout, Math: Object.create(Math, { random: { value: random } }),
         Date: skipWaits ? TestClock : Date
     });
-    return { handlers, logs, closed: () => closed };
+    return { handlers, logs, stateFolder, closed: () => closed };
 }
 
 test('oldest deletion ignores navigation/profile menus and waits for sorted rows', async () => {
@@ -317,6 +339,121 @@ test('a copy action that stays on Drafts identifies the exact missing step', asy
     assert.equal(state.posts, 0);
 });
 
+test('recognizes On Sale despite its List Item button and reads the copied ID from query parameters', async () => {
+    state.queryEditor = true;
+    state.publishToOnSale = true;
+    state.saleListButton = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json'))).submissions.length, 1);
+});
+
+test('reads a copied listing ID from its form when the preview URL has no ID', async () => {
+    await page.setContent(`<header><form><input name="id" value="${OLD}" type="hidden"><button>List Item</button></form></header>
+        <form><input name="listing_id" value="${NEW}" type="hidden"><button>List Item</button></form>`);
+    const context = await controls.capturePublication(page);
+    assert.equal(context.id, NEW);
+});
+
+test('finds the submitted listing on a later On Sale page without resubmitting', async () => {
+    state.publishToOnSale = true;
+    state.afterPost = () => { state.salePages = [sourceIds(500, 50), [NEW]]; };
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+    assert.ok(state.requests.some(value => {
+        const url = new URL(value);
+        return url.pathname === '/listings/onsale' && url.searchParams.get('page') === '2';
+    }));
+});
+
+test('rechecks delayed On Sale indexing without posting the listing twice', async () => {
+    state.publishToOnSale = true;
+    state.indexDelay = 1100;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+});
+
+test('a submitted listing left on the preview is verified read-only after the UI wait', async () => {
+    state.stayPreview = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+});
+
+test('publication observation can outwait the ordinary page timeout and a visible List Item button', async () => {
+    await page.setContent('<button>List Item</button><div id="feedback"></div>');
+    const context = await controls.capturePublication(page);
+    page.setDefaultTimeout(75);
+    await page.evaluate(() => setTimeout(() => {
+        document.querySelector('#feedback').innerHTML = '<div role="status">Your item was listed successfully.</div>';
+    }, 300));
+    assert.equal(await controls.waitForPublished(page, context, { timeoutMs: 1000 }), null);
+});
+
+test('actual browser click events are separated by at least the action delay', async () => {
+    setPagePacer(page);
+    await page.setContent('<button onclick="window.clicks.push(performance.now())">Done</button>');
+    await page.evaluate(() => { window.clicks = []; });
+    await controls.clickControl(page, 'done');
+    await controls.clickControl(page, 'done');
+    const clicks = await page.evaluate(() => window.clicks);
+    assert.equal(clicks.length, 2);
+    assert.ok(clicks[1] - clicks[0] >= 1990, 'Clicks were not paced by two seconds');
+});
+
+test('finds a freshly rendered control after the action pause', async () => {
+    await page.setContent('<button>Done</button>');
+    let clock = 0;
+    setPagePacer(page, new ActionPacer({ now: () => clock, sleep: async ms => {
+        clock += ms;
+        await page.evaluate(() => {
+            document.querySelector('button').outerHTML = '<button onclick="window.clicked=true">Done</button>';
+        });
+    } }));
+    await controls.clickControl(page, 'done');
+    assert.equal(await page.evaluate(() => window.clicked), true);
+});
+
+test('restarting after one post preserves the cooldown before any new website action', async () => {
+    const first = mainProcess();
+    assert.equal((await first.handlers.get('process-drafts')({ sender: {} }, {})).postedCount, 1);
+    const requestCount = state.requests.length;
+    const second = mainProcess({ stateFolder: first.stateFolder });
+    const run = second.handlers.get('process-drafts')({ sender: {} }, {});
+    await new Promise(resolve => setTimeout(resolve, 20));
+    assert.ok(second.logs.some(message => message.includes('220-second minimum')));
+    assert.equal(state.requests.length, requestCount);
+    await second.handlers.get('stop-drafts')();
+    assert.equal((await run).postedCount, 0);
+    assert.equal(state.posts, 1);
+});
+
+test('reaching 400 recorded submissions stops before the next draft is submitted', async () => {
+    state.drafts = 2;
+    const main = mainProcess();
+    fs.writeFileSync(path.join(main.stateFolder, 'posting-history.json'), JSON.stringify({
+        version: 1, cooldownUntil: 0,
+        submissions: Array.from({ length: 399 }, (_, index) => Date.now() - (400 - index) * 1000)
+    }));
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /Daily limit reached: 400/);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json'))).submissions.length, 400);
+});
+
 test('missing Oldest option stops without deleting any listing', async () => {
     state.sortBroken = true;
     await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /Oldest option/);
@@ -335,7 +472,7 @@ test('the newly published listing is protected when it is the only listing', asy
     assert.deepEqual(state.deleted, []);
 });
 
-test('checkbox off posts once without visiting On Sale or deleting', async () => {
+test('checkbox off verifies the post using a read-only On Sale check without deleting', async () => {
     const main = mainProcess();
     const tabs = (await browser.pages()).length;
     const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: false });
@@ -343,7 +480,8 @@ test('checkbox off posts once without visiting On Sale or deleting', async () =>
     assert.equal(result.postedCount, 1, JSON.stringify({ result, logs: main.logs }));
     assert.equal(state.posts, 1);
     assert.deepEqual(state.deleted, []);
-    assert.equal(state.visits.includes('/listings/onsale'), false);
+    assert.equal(state.visits.includes('/listings/onsale'), true);
+    assert.equal(state.visits.includes('/fixture/delete'), false);
     assert.equal((await browser.pages()).length, tabs);
     assert.equal(main.closed(), true);
 });

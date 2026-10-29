@@ -80,7 +80,32 @@ If posting, sorting, or deletion cannot be confirmed, the run pauses with an
 error. Check Gameflip before restarting after an uncertain publication, to avoid
 posting a duplicate. The pointer is moved out of the header before actions, and
 profile menus and section navigation links are excluded from deletion targets.
-Posting still waits 220–240 seconds between items, including continuous loops.
+## Timing and posting limits
+
+Navigation and clicks are separated by at least two seconds after the previous
+action completes. Controls must also be ready before they are clicked. After
+List Item, the app allows a 90-second confirmation window and checks On Sale by
+the copied listing's ID, including subsequent pages. A List Item button on the
+On Sale page does not prevent confirmation. Verification only reads pages; it
+does not click List Item again.
+
+There is a minimum 220-second cooldown after a submission and its verification
+or count maintenance finish. Stop, restart, and continuous loops preserve that
+cooldown. A single-instance lock prevents a second copy of the app running at
+the same time.
+
+The app caps its recorded submissions at 400 in a rolling 24-hour period. An
+attempt is recorded before the submit click, so a post with an uncertain outcome
+still consumes a slot. A crash during confirmation keeps a longer provisional
+cooldown. The run pauses at the daily cap. An unreadable history pauses posting
+instead of resetting the counter.
+
+History is stored in `posting-history.json` in Electron's user-data folder
+(`%APPDATA%\gameflip-poster` on Windows), outside the Git checkout. Updates do not
+replace it. Tracking starts with this version: older submissions, manual posts,
+and posts through other clients are not counted. This is an app limit, not a
+reading of your account's remaining Gameflip quota. Keep enough room for those
+other posts and follow Gameflip's account limits.
 
 ## Tests
 
@@ -91,7 +116,8 @@ npm test
 Tests launch an isolated headless browser and intercept all network requests with
 local page fixtures. They cover the checkbox, competing profile/navigation
 menus, multi-page draft scanning, shifted row positions, consecutive posts,
-delayed sorting, posting and deletion failures, single-tab actions,
+delayed indexing, On Sale confirmation, paced clicks, persistent cooldowns,
+the 400-submission cap, delayed sorting, posting and deletion failures, single-tab actions,
 overlapping runs, stopping, and loop rate limiting. They do not use your login
 profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.
