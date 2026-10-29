@@ -4,11 +4,13 @@ const fs = require('node:fs');
 const path = require('node:path');
 const vm = require('node:vm');
 const os = require('node:os');
+const { EventEmitter } = require('node:events');
 const puppeteer = require('puppeteer');
 const controls = require('../listing-controls');
 const drafts = require('../drafts');
 const { ActionPacer, setPagePacer } = require('../pacing');
 const budgets = require('../posting-budget');
+const diagnostics = require('../run-log');
 
 const OLD = '11111111-1111-4111-8111-111111111111';
 const RECENT = '22222222-2222-4222-8222-222222222222';
@@ -62,7 +64,8 @@ beforeEach(async () => {
         } else {
             body = fixture(url);
         }
-        await request.respond({ status: 200, contentType: url.pathname.startsWith('/fixture/') ? 'application/json' : 'text/html', body });
+        await request.respond({ status: state.documentStatus?.(url) || 200,
+            contentType: url.pathname.startsWith('/fixture/') ? 'application/json' : 'text/html', body });
     });
 });
 afterEach(async () => {
@@ -146,7 +149,7 @@ function links(ids) {
     return ids.map(id => `<a target="_blank" href="${itemUrl(id)}">Listing ${id}</a>`).join('');
 }
 
-function mainProcess({ random = Math.random, skipWaits = false, stateFolder } = {}) {
+function mainProcess({ random = Math.random, skipWaits = false, stateFolder, launchError, closeError } = {}) {
     if (!stateFolder) {
         stateFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'autoposter-state-test-'));
         stateFolders.push(stateFolder);
@@ -155,7 +158,10 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder } = 
     const logs = [];
     const win = { isDestroyed: () => false, webContents: { send: (_, message) => logs.push(message) } };
     let closed = false;
-    const fakeBrowser = { pages: async () => [page], close: async () => { closed = true; } };
+    const fakeBrowser = Object.assign(new EventEmitter(), { pages: async () => [page], close: async () => {
+        closed = true;
+        if (closeError) throw closeError;
+    } });
     const electron = {
         app: { getPath: () => stateFolder, whenReady: () => ({ then() {} }), requestSingleInstanceLock: () => true, quit() {} },
         BrowserWindow: { fromWebContents: () => win },
@@ -167,8 +173,9 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder } = 
         controls.waitForPublished(target, context, { ...options, timeoutMs: 1500, retryDelayMs: 50 }) };
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8'), {
         require: name => name === 'electron' ? electron : name === 'puppeteer'
-            ? { launch: async () => fakeBrowser } : name === './listing-controls' ? testingControls
-                : name === './drafts' ? drafts : name === './posting-budget' ? budgets : require(name),
+            ? { launch: async () => { if (launchError) throw launchError; return fakeBrowser; } } : name === './listing-controls' ? testingControls
+                : name === './drafts' ? drafts : name === './posting-budget' ? budgets
+                    : name === './run-log' ? diagnostics : name === './package.json' ? require('../package.json') : require(name),
         process, console, setTimeout: global.setTimeout, Math: Object.create(Math, { random: { value: random } }),
         Date: skipWaits ? TestClock : Date
     });
@@ -193,6 +200,124 @@ test('oldest deletion ignores navigation/profile menus and waits for sorted rows
 
 const sourceId = n => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
 const sourceIds = (start, count) => Array.from({ length: count }, (_, index) => sourceId(start + index));
+
+// Reproduce Chromium exposing a revalidation response while its cached HTML
+// remains rendered. Intercepted HTTP 304 alone has no browser-cache body.
+function cachedNavigation(matches) {
+    const goto = page.goto.bind(page);
+    page.goto = async (url, options) => {
+        const response = await goto(url, options);
+        return matches(new URL(url)) ? { ok: () => false, status: () => 304 } : response;
+    };
+}
+
+for (const cachedPage of [1, 2]) {
+    test(`cached HTTP 304 on draft page ${cachedPage} still produces the complete queue`, async () => {
+        state.draftPages = [sourceIds(100, 50), [sourceId(150)]];
+        cachedNavigation(url => url.pathname === '/listings/draft' && Number(url.searchParams.get('page')) === cachedPage);
+        const queue = await drafts.scanDrafts(page, () => {});
+        assert.equal(queue.length, 51);
+        assert.equal(queue.at(-1).key, sourceId(150));
+        assert.equal(state.posts, 0);
+    });
+}
+
+test('an empty 304 cache response is checked without cache before ending the scan', async () => {
+    state.draftPages = [sourceIds(100, 50), [sourceId(150)]];
+    const goto = page.goto.bind(page);
+    let cacheMiss = true;
+    page.goto = async (url, options) => {
+        const response = await goto(url, options);
+        if (new URL(url).searchParams.get('page') === '2' && cacheMiss) {
+            cacheMiss = false;
+            await page.setContent('<!doctype html><body></body>');
+            return { ok: () => false, status: () => 304 };
+        }
+        return response;
+    };
+    const logs = [];
+    const queue = await drafts.scanDrafts(page, message => logs.push(message));
+    assert.equal(queue.length, 51);
+    assert.equal(state.requests.filter(url => new URL(url).searchParams.get('page') === '2').length, 2);
+    assert.ok(logs.some(message => message.includes('checking once without cache')));
+});
+
+test('cached drafts and On Sale verification complete without resubmitting', async () => {
+    state.publishToOnSale = true;
+    cachedNavigation(url => ['/listings/draft', '/listings/onsale'].includes(url.pathname));
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+    assert.deepEqual(state.deleted, []);
+});
+
+test('304 without cached content cannot silently end a partially scanned queue', async () => {
+    state.draftPages = [sourceIds(100, 50), []];
+    cachedNavigation(url => url.searchParams.get('page') === '2');
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /page 2 still has no usable cached draft content/);
+    assert.equal(state.posts, 0);
+    assert.equal(main.logs.some(message => message.includes('Scan complete')), false);
+});
+
+test('304 does not bypass the repeated-page safeguard or expose a partial queue', async () => {
+    state.draftPages = [sourceIds(100, 50)];
+    state.pager = 'none';
+    state.ignorePage = true;
+    cachedNavigation(() => true);
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /page 2 repeated/);
+    assert.equal(state.posts, 0);
+    assert.equal(main.closed(), true);
+});
+
+test('an HTTP failure records the scan step, exact page, status, and stack before closing', async () => {
+    state.draftPages = [sourceIds(100, 50), [sourceId(150)]];
+    state.documentStatus = url => url.pathname === '/listings/draft' && url.searchParams.get('page') === '2' ? 403 : 200;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /Draft page 2 returned HTTP 403/);
+    const logs = main.logs.join('\n');
+    assert.match(logs, /HTTP 403 https:\/\/gameflip.com\/listings\/draft\?page=2&limit=50/);
+    assert.match(logs, /paused during "Scanning all draft pages" after [\d.]+s; 0 confirmed posts/);
+    assert.match(logs, /Page state: .*"draftCopies":1/);
+    assert.match(logs, /Error details:\nError: Draft page 2/);
+    assert.match(logs, /Closing Chrome for this session/);
+    assert.ok(logs.includes(`Autoposter v${require('../package.json').version}`));
+    const saved = fs.readFileSync(path.join(main.stateFolder, 'autoposter.log'), 'utf8');
+    assert.match(saved, /Draft page 2 returned HTTP 403/);
+    assert.equal(state.posts, 0);
+});
+
+test('Chrome launch failures are logged and release the run guard', async () => {
+    const main = mainProcess({ launchError: new Error('Test Chrome startup failed') });
+    for (let attempt = 0; attempt < 2; attempt++) {
+        const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+        assert.equal(result.success, false);
+        assert.equal(result.postedCount, 0);
+        assert.match(result.error, /Test Chrome startup failed/);
+    }
+    assert.ok(main.logs.some(message => message.includes('paused during "Launching Chrome"')));
+    assert.equal(main.closed(), false);
+});
+
+test('a Chrome cleanup failure preserves the original missing-editor error', async () => {
+    state.blockCopy = true;
+    const main = mainProcess({ closeError: new Error('Test cleanup failed') });
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /Done control in the draft editor/);
+    assert.ok(main.logs.some(message => message.includes('Chrome cleanup: Test cleanup failed')));
+    assert.equal(main.logs.some(message => message.includes('GHOST SESSION CLOSED')), false);
+    assert.equal(state.posts, 0);
+});
 
 test('scans full pages without recognizable pagination and indexes every draft', async () => {
     state.draftPages = [sourceIds(100, 50), sourceIds(150, 50), sourceIds(200, 3)];
@@ -569,7 +694,7 @@ test('a one-draft continuous loop still waits for the posting rate limit', async
 test('the GUI captures the checkbox and locks settings until posting finishes', async () => {
     await page.evaluate(() => {
         window.calls = [];
-        window.require = () => ({ ipcRenderer: {
+        window.require = () => ({ clipboard: { writeText: text => { window.copiedLogs = text; } }, ipcRenderer: {
             on() {}, send() {},
             invoke: async (channel, config) => {
                 window.calls.push({ channel, config });
@@ -589,4 +714,6 @@ test('the GUI captures the checkbox and locks settings until posting finishes', 
     await page.waitForFunction(() => !document.querySelector('#maintainLimit').disabled);
     assert.match(await page.$eval('#logContainer', el => el.textContent), /paused after 1 confirmed posts: Deletion not confirmed/);
     assert.equal(await page.$eval('#maintainLimit', el => el.checked), true);
+    await page.click('#copyLogs');
+    assert.match(await page.evaluate(() => window.copiedLogs), /paused after 1 confirmed posts: Deletion not confirmed/);
 });

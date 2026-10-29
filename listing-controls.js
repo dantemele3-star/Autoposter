@@ -120,6 +120,12 @@ async function navigate(page, url) {
     return response;
 }
 
+function usablePageResponse(response) {
+    // Chrome may expose the cache revalidation status even though the rendered
+    // document is available. Callers still validate its section and contents.
+    return !response || response.ok() || response.status() === 304;
+}
+
 async function dismissPopup(page) {
     const initial = await page.evaluateHandle(findControl, 'dismiss');
     const present = Boolean(initial.asElement());
@@ -242,7 +248,7 @@ async function findPostedOnSale(page, id, deadline) {
     const seen = new Set();
     for (let number = 1; ; number++) {
         const response = await navigate(page, `${ON_SALE}?page=${number}&limit=50`);
-        if ((response && !response.ok()) || new URL(page.url()).pathname.replace(/\/$/, '') !== '/listings/onsale') return false;
+        if (!usablePageResponse(response) || new URL(page.url()).pathname.replace(/\/$/, '') !== '/listings/onsale') return false;
         const ids = [...new Set((await activeListingLinks(page)).map(listingId))];
         if (ids.includes(id)) return true;
         const signature = JSON.stringify(ids);
@@ -282,5 +288,5 @@ async function waitForPublished(page, context, {
 
 module.exports = {
     listingId, findControl, clickElement, clickControl, waitForControl, navigate, dismissPopup,
-    deleteOldestListing, capturePublication, waitForPublished, settle
+    deleteOldestListing, capturePublication, waitForPublished, settle, usablePageResponse
 };

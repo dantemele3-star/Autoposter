@@ -59,13 +59,35 @@ Each cycle scans `/listings/draft?page=1&limit=50`, page 2, and subsequent
 pages before randomizing or posting. A full page is followed even if Gameflip's
 Next control is not recognized. The log prints **Scan complete** with the total
 number of unique drafts before posting begins. Repeated pages or failed requests
-pause the run rather than post from an incomplete scan.
+pause the run rather than post from an incomplete scan. HTTP 304 (Not Modified)
+is accepted as a cache response; the rendered page is still checked for the
+correct section, identifiable drafts, and repeated pages. The same cache handling
+applies when verifying a publication in On Sale.
 
 Drafts are identified by their listing IDs or unique copy links. If creating a
 copy shifts the rows or moves a draft to another page, the app locates the
 original draft again instead of clicking its old row number. Newly appearing
 drafts are picked up in the next cycle. The log names the copy, Done, preview,
 and submission steps so a timeout identifies which step failed.
+
+## Share a failure log
+
+Click **Copy Logs** after a failure and paste the result when reporting it. The
+log includes the app version, settings, current step and elapsed time, listing
+IDs, navigation addresses, HTTP response codes, and error details. Failure reports
+also include page readiness, visible action controls, and recent browser or
+Gameflip request failures. Normal session cleanup is logged separately from an
+unexpected browser disconnect.
+
+Logs are also saved across restarts to `%APPDATA%\gameflip-poster\autoposter.log`
+on Windows. The app prints the actual path at startup. At 1 MiB it rotates to
+`autoposter.log.previous`, retaining at most these two files. If saving fails,
+the app warns you and Copy Logs remains available.
+
+Diagnostics do not collect cookies, request headers/bodies, page HTML, or
+screenshots. URL fragments and query parameters other than numeric `page` and
+`limit` are omitted, and common credential patterns are redacted. Logs remain
+local and are excluded from Git.
 
 ## Maintain listing count
 
@@ -116,8 +138,9 @@ npm test
 Tests launch an isolated headless browser and intercept all network requests with
 local page fixtures. They cover the checkbox, competing profile/navigation
 menus, multi-page draft scanning, shifted row positions, consecutive posts,
-delayed indexing, On Sale confirmation, paced clicks, persistent cooldowns,
-the 400-submission cap, delayed sorting, posting and deletion failures, single-tab actions,
+cached-page responses, failure diagnostics, delayed indexing, On Sale confirmation,
+paced clicks, persistent cooldowns, the 400-submission cap, delayed sorting,
+posting and deletion failures, single-tab actions,
 overlapping runs, stopping, and loop rate limiting. They do not use your login
 profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.

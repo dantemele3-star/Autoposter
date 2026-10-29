@@ -6,3 +6,5 @@ Gameflip_Ghost_Session/
 gameflip_session/
 /listings_log.json
 /dist/
+*.log
+*.log.previous

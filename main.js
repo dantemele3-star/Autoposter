@@ -10,6 +10,8 @@ const {
 } = require('./listing-controls');
 const { scanDrafts, openDraft } = require('./drafts');
 const { PostingBudget, DAILY_LIMIT } = require('./posting-budget');
+const { RunLog, redact } = require('./run-log');
+const { version } = require('./package.json');
 
 let shouldStop = false;
 let isRunning = false;
@@ -21,10 +23,12 @@ async function waitBetweenPosts(ms) {
     }
 }
 
-async function waitForPostingSlot(win, budget) {
+async function waitForPostingSlot(run, budget) {
+    run.step('Checking the saved posting limits');
     const { waitMs } = budget.status();
     if (waitMs > 0 && !shouldStop) {
-        sendLog(win, `⏳ Rate Limit Protection: ${Math.ceil(waitMs / 1000)}s remain in the 220-second minimum posting interval...`);
+        run.step('Waiting for the posting interval');
+        run.write(`⏳ Rate Limit Protection: ${Math.ceil(waitMs / 1000)}s remain in the 220-second minimum posting interval...`);
         await waitBetweenPosts(waitMs);
     }
     return !shouldStop;
@@ -36,8 +40,9 @@ function sendLog(win, message) {
     }
 }
 
-async function processDrafts(win, config, budget) {
-    if (!await waitForPostingSlot(win, budget)) return { success: true, postedCount: 0 };
+async function processDrafts(run, config, budget) {
+    if (!await waitForPostingSlot(run, budget)) return { success: true, postedCount: 0 };
+    const log = message => run.write(message);
     const sessionPath = process.platform === 'win32'
         ? path.join(os.homedir(), 'AppData', 'Local', 'Gameflip_Ghost_Session')
         : path.join(app.getPath('userData'), 'Gameflip_Ghost_Session');
@@ -47,53 +52,56 @@ async function processDrafts(win, config, budget) {
             .find(file => fs.existsSync(file))
         : undefined);
 
-    const browser = await puppeteer.launch({
-        headless: config.headless,
-        defaultViewport: null,
-        executablePath,
-        userDataDir: sessionPath,
-        protocolTimeout: 120000,
-        args: [
-            '--disable-blink-features=AutomationControlled',
-            '--start-maximized',
-            '--disable-background-timer-throttling',
-            '--disable-backgrounding-occluded-windows',
-            '--disable-renderer-backgrounding'
-        ]
-    });
-
-    const pages = await browser.pages();
-    const page = pages.length > 0 ? pages[0] : await browser.newPage();
-
-    page.setDefaultTimeout(30000);
+    let browser, page;
     let postedCount = 0;
-
     try {
-        sendLog(win, "\n--- 👻 GHOST SESSION STARTED ---");
-        sendLog(win, `Mode: ${config.headless ? 'Headless (Hidden)' : 'Headed (Visible)'}`);
-        sendLog(win, `Tracked app submissions in the last 24 hours: ${budget.status().count}/${DAILY_LIMIT}. Browser actions are spaced by at least 2 seconds.`);
-        sendLog(win, "Navigating to Gameflip Drafts...");
+        run.step('Launching Chrome');
+        browser = await puppeteer.launch({
+            headless: config.headless,
+            defaultViewport: null,
+            executablePath,
+            userDataDir: sessionPath,
+            protocolTimeout: 120000,
+            args: [
+                '--disable-blink-features=AutomationControlled',
+                '--start-maximized',
+                '--disable-background-timer-throttling',
+                '--disable-backgrounding-occluded-windows',
+                '--disable-renderer-backgrounding'
+            ]
+        });
+
+        const pages = await browser.pages();
+        page = pages.length > 0 ? pages[0] : await browser.newPage();
+        run.attach(page, browser);
+
+        page.setDefaultTimeout(30000);
+
+        log("\n--- 👻 GHOST SESSION STARTED ---");
+        log(`Mode: ${config.headless ? 'Headless (Hidden)' : 'Headed (Visible)'}`);
+        log(`Tracked app submissions in the last 24 hours: ${budget.status().count}/${DAILY_LIMIT}. Browser actions are spaced by at least 2 seconds.`);
+        run.step('Navigating to Gameflip Drafts');
         await navigate(page, 'https://gameflip.com/listings/draft');
 
         if (page.url().includes('login')) {
-            sendLog(win, "⚠️ Not logged in. Please log in manually...");
+            run.step('Waiting for manual Gameflip login');
             await page.waitForFunction(() => window.location.href.includes('/listings/draft'), { timeout: 600000 });
-            sendLog(win, "✅ Login detected. Continuing...");
+            log("✅ Login detected. Continuing...");
             await dismissPopup(page);
         }
 
-        sendLog(win, "Scanning for all drafts across all pages...");
-        const processingQueue = await scanDrafts(page, message => sendLog(win, message), () => shouldStop);
+        run.step('Scanning all draft pages');
+        const processingQueue = await scanDrafts(page, log, () => shouldStop);
         if (shouldStop) return { success: true, postedCount };
 
         if (processingQueue.length === 0) {
             throw new Error("No drafts found. Please ensure you are on the Drafts page.");
         }
 
-        sendLog(win, `🎯 Total found: ${processingQueue.length} drafts to process.`);
+        log(`🎯 Total found: ${processingQueue.length} drafts to process.`);
 
         if (config.randomize) {
-            sendLog(win, "🎲 Randomizing processing order...");
+            log("🎲 Randomizing processing order...");
             for (let i = processingQueue.length - 1; i > 0; i--) {
                 const j = Math.floor(Math.random() * (i + 1));
                 [processingQueue[i], processingQueue[j]] = [processingQueue[j], processingQueue[i]];
@@ -102,62 +110,73 @@ async function processDrafts(win, config, budget) {
 
         for (let i = 0; i < processingQueue.length; i++) {
             if (shouldStop) {
-                sendLog(win, "\n🛑 Stop signal received. Ending session...");
+                log("\n🛑 Stop signal received. Ending session...");
                 break;
             }
 
-            if (!await waitForPostingSlot(win, budget)) break;
+            if (!await waitForPostingSlot(run, budget)) break;
             const item = processingQueue[i];
-            sendLog(win, `\n📦 Processing Item ${i + 1}/${processingQueue.length} (Scanned page ${item.page}, row ${item.index + 1})...`);
+            log(`\n📦 Processing Item ${i + 1}/${processingQueue.length} (Scanned page ${item.page}, row ${item.index + 1})...`);
+            log(`Source draft: ${item.key}`);
 
-            sendLog(win, 'Opening the selected draft copy...');
-            if (!await openDraft(page, item, message => sendLog(win, message), () => shouldStop)) break;
+            run.step('Opening the selected draft copy');
+            if (!await openDraft(page, item, log, () => shouldStop)) break;
             await dismissPopup(page);
-            sendLog(win, 'Waiting for Done in the draft editor...');
+            run.step('Waiting for Done in the draft editor');
             await clickControl(page, 'done');
             await settle(page);
             await dismissPopup(page);
             // Wait for the preview before capturing the new copy's ID.
-            sendLog(win, 'Waiting for List Item in the listing preview...');
+            run.step('Waiting for List Item in the listing preview');
             const listReady = await waitForControl(page, 'list');
             await listReady.dispose();
             let publication;
             let recorded = false;
             try {
-                sendLog(win, 'Submitting the listing; confirmation may take up to 90 seconds...');
+                run.step('Submitting the listing (confirmation can take up to 90 seconds)');
                 await clickControl(page, 'list', { beforeClick: async () => {
                     publication = await capturePublication(page);
                     const count = budget.reserve();
                     recorded = true;
-                    sendLog(win, `Submission recorded: ${count}/${DAILY_LIMIT} in the last 24 hours.`);
+                    log(`Submission recorded: ${count}/${DAILY_LIMIT} in the last 24 hours.`);
                 } });
-                const publishedId = await waitForPublished(page, publication, { log: message => sendLog(win, message) });
+                log(`Submitted listing ID: ${publication.id || 'not available in the preview'}`);
+                run.step('Confirming publication in On Sale');
+                const publishedId = await waitForPublished(page, publication, { log });
                 postedCount++;
-                sendLog(win, '✅ Publication confirmed.');
+                log('✅ Publication confirmed.');
                 if (config.maintainLimit) {
                     if (!publishedId) throw new Error('Publication succeeded, but its ID could not be identified. Count maintenance paused; nothing was deleted.');
-                    await deleteOldestListing(page, message => sendLog(win, message), publishedId);
+                    run.step('Deleting and verifying the oldest listing');
+                    await deleteOldestListing(page, log, publishedId);
                 }
             } finally {
                 if (recorded) budget.finishAttempt();
             }
 
             if ((i < processingQueue.length - 1 || config.loop) && !shouldStop) {
-                await waitForPostingSlot(win, budget);
+                await waitForPostingSlot(run, budget);
             }
 
         }
 
-        sendLog(win, `\n--- 🏁 CYCLE FINISHED ---`);
-        sendLog(win, `Total successfully posted in this cycle: ${postedCount}`);
+        log(`\n--- 🏁 CYCLE FINISHED ---`);
+        log(`Total successfully posted in this cycle: ${postedCount}`);
         return { success: true, postedCount };
     } catch (err) {
-        sendLog(win, `⚠️ Posting paused: ${err.message}`);
+        await run.report(err, page, postedCount);
         err.postedCount = postedCount;
         throw err;
     } finally {
-        await browser.close();
-        sendLog(win, "--- 👻 GHOST SESSION CLOSED ---");
+        run.detach();
+        if (browser) {
+            log('Closing Chrome for this session...');
+            try {
+                await browser.close();
+                log("--- 👻 GHOST SESSION CLOSED ---");
+            }
+            catch (error) { log(`⚠️ Chrome cleanup: ${error.message}`); }
+        }
     }
 }
 
@@ -167,18 +186,24 @@ ipcMain.handle('process-drafts', async (event, config = {}) => {
     isRunning = true;
     shouldStop = false;
     let totalPosted = 0;
+    const run = new RunLog(path.join(app.getPath('userData'), 'autoposter.log'), message => sendLog(win, message));
     try {
+        run.write(`Autoposter v${version}; Node ${process.versions.node}; ${process.platform}.`);
+        run.write(`Settings: ${JSON.stringify({ headless: !!config.headless, randomize: !!config.randomize, loop: !!config.loop, maintainLimit: !!config.maintainLimit })}`);
+        run.write(`Diagnostic log: ${run.file}`);
         const budget = new PostingBudget(path.join(app.getPath('userData'), 'posting-history.json'), { now: () => Date.now() });
         do {
-            const result = await processDrafts(win, config, budget);
+            const result = await processDrafts(run, config, budget);
             totalPosted += result.postedCount;
             if (!config.loop || shouldStop) break;
-            sendLog(win, '♻️ Loop enabled. Restarting in 30 seconds...');
+            run.step('Waiting to restart the next cycle');
+            run.write('♻️ Loop enabled. Restarting in 30 seconds...');
             await waitBetweenPosts(30000);
         } while (!shouldStop);
         return { success: true, postedCount: totalPosted };
     } catch (err) {
-        return { success: false, postedCount: totalPosted + (err.postedCount || 0), error: err.message };
+        if (run.reportedError !== err) await run.report(err, null, totalPosted);
+        return { success: false, postedCount: totalPosted + (err.postedCount || 0), error: redact(err.message) };
     } finally {
         isRunning = false;
     }
