@@ -1,2 +1,6 @@
-﻿node_modules/
+node_modules/
 Gameflip_Ghost_Session/
+.env
+.env.*
+!.env.example
+gameflip_session/
