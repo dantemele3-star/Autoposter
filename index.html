@@ -268,6 +268,7 @@
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
         const logContainer = document.getElementById('logContainer');
+        const settings = [...document.querySelectorAll('.settings-grid input')];
 
         // Window Controls
         document.getElementById('minWin').addEventListener('click', () => ipcRenderer.send('window-minimize'));
@@ -288,6 +289,7 @@
             logContainer.innerText = "🚀 Initializing Ghost Session... Please wait.";
             startBtn.style.display = "none";
             stopBtn.style.display = "block";
+            settings.forEach(input => input.disabled = true);
 
             const config = {
                 randomize: document.getElementById('randomize').checked,
@@ -301,13 +303,14 @@
                 if (result.success) {
                     appendLog(`\n✅ COMPLETED! Total items listed: ${result.postedCount}`);
                 } else {
-                    appendLog(`\n❌ Error: ${result.error}`);
+                    appendLog(`\n❌ Posting paused after ${result.postedCount || 0} confirmed posts: ${result.error}`);
                 }
             } catch (err) {
                 appendLog(`\n❌ System Error: ${err.message}`);
             } finally {
                 startBtn.style.display = "block";
                 stopBtn.style.display = "none";
+                settings.forEach(input => input.disabled = false);
             }
         });
 
