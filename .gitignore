@@ -4,3 +4,5 @@ Gameflip_Ghost_Session/
 .env.*
 !.env.example
 gameflip_session/
+/listings_log.json
+/dist/

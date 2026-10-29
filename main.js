@@ -70,7 +70,7 @@ async function processDrafts(win, config) {
         }
 
         sendLog(win, "Scanning for all drafts across all pages...");
-        let allDraftIndices = [];
+        const processingQueue = [];
         let currentPage = 1;
         let hasMorePages = true;
 
@@ -83,7 +83,7 @@ async function processDrafts(win, config) {
             sendLog(win, `Found ${pageDrafts.length} drafts on page ${currentPage}.`);
 
             for (let i = 0; i < pageDrafts.length; i++) {
-                allDraftIndices.push({ page: currentPage, index: i });
+                processingQueue.push({ page: currentPage, index: i });
             }
 
             const nextExists = await page.evaluate(() => [...document.querySelectorAll('.pagination a, a[rel="next"]')]
@@ -100,13 +100,12 @@ async function processDrafts(win, config) {
             }
         }
 
-        if (allDraftIndices.length === 0) {
+        if (processingQueue.length === 0) {
             throw new Error("No drafts found. Please ensure you are on the Drafts page.");
         }
 
-        sendLog(win, `🎯 Total found: ${allDraftIndices.length} drafts to process.`);
+        sendLog(win, `🎯 Total found: ${processingQueue.length} drafts to process.`);
 
-        let processingQueue = [...allDraftIndices];
         if (config.randomize) {
             sendLog(win, "🎲 Randomizing processing order...");
             for (let i = processingQueue.length - 1; i > 0; i--) {
@@ -124,51 +123,46 @@ async function processDrafts(win, config) {
             const item = processingQueue[i];
             sendLog(win, `\n📦 Processing Item ${i + 1}/${processingQueue.length} (Page ${item.page}, Index ${item.index + 1})...`);
 
-            try {
-                await navigate(page, `https://gameflip.com/listings/draft?page=${item.page}`);
+            await navigate(page, `https://gameflip.com/listings/draft?page=${item.page}`);
 
-                await dismissPopup(page);
+            await dismissPopup(page);
 
-                const currentButtons = await page.$$('.tool-duplicate');
-                if (currentButtons.length <= item.index) {
-                    sendLog(win, " ⚠️ Item no longer at this position on page, skipping.");
-                    continue;
-                }
-                const copyButton = currentButtons[item.index];
-
-                await clickElement(page, copyButton);
-                await settle(page);
-                await dismissPopup(page);
-                await clickControl(page, 'done');
-                await settle(page);
-                await dismissPopup(page);
-                // Wait for the preview before capturing the new copy's ID.
-                const listReady = await page.waitForFunction(findControl, {}, 'list');
-                await listReady.dispose();
-                const draftId = listingId(page.url());
-                await clickControl(page, 'list');
-                const publishedId = await waitForPublished(page, draftId);
-
-                postedCount++;
-                sendLog(win, ` ✨ Item processed successfully.`);
-
-                if (config.maintainLimit) {
-                    await deleteOldestListing(page, message => sendLog(win, message), publishedId);
-                }
-
-                const minDelay = 220000;
-                const randomBuffer = Math.floor(Math.random() * 20000);
-                const totalDelay = minDelay + randomBuffer;
-
-                if ((i < processingQueue.length - 1 || config.loop) && !shouldStop) {
-                    sendLog(win, `⏳ Rate Limit Protection: Waiting ${Math.round(totalDelay/1000)}s until next post...`);
-                    await waitBetweenPosts(totalDelay);
-                }
-
-            } catch (itemErr) {
-                sendLog(win, ` ❌ Item failed: ${itemErr.message}`);
-                throw itemErr;
+            const currentButtons = await page.$$('.tool-duplicate');
+            if (currentButtons.length <= item.index) {
+                sendLog(win, " ⚠️ Item no longer at this position on page, skipping.");
+                continue;
             }
+            const copyButton = currentButtons[item.index];
+
+            await clickElement(page, copyButton);
+            await settle(page);
+            await dismissPopup(page);
+            await clickControl(page, 'done');
+            await settle(page);
+            await dismissPopup(page);
+            // Wait for the preview before capturing the new copy's ID.
+            const listReady = await page.waitForFunction(findControl, {}, 'list');
+            await listReady.dispose();
+            const draftId = listingId(page.url());
+            await clickControl(page, 'list');
+            const publishedId = await waitForPublished(page, draftId);
+
+            postedCount++;
+            sendLog(win, ` ✨ Item processed successfully.`);
+
+            if (config.maintainLimit) {
+                await deleteOldestListing(page, message => sendLog(win, message), publishedId);
+            }
+
+            const minDelay = 220000;
+            const randomBuffer = Math.floor(Math.random() * 20000);
+            const totalDelay = minDelay + randomBuffer;
+
+            if ((i < processingQueue.length - 1 || config.loop) && !shouldStop) {
+                sendLog(win, `⏳ Rate Limit Protection: Waiting ${Math.round(totalDelay/1000)}s until next post...`);
+                await waitBetweenPosts(totalDelay);
+            }
+
         }
 
         sendLog(win, `\n--- 🏁 CYCLE FINISHED ---`);

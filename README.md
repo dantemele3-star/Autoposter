@@ -19,19 +19,27 @@ Leave Hidden Mode unchecked when signing into Gameflip. Your existing
 
 ## Get updates without patches
 
-The fixes are maintained on the `fix/gameflip-listing-flow` branch. From your
-existing GameflipApp folder, switch to it once:
+The maintained app is on the default `main` branch. Close Autoposter before
+updating, then double-click **Update-Autoposter.cmd** to pull the latest changes,
+install dependencies, and start the app. Git and Node.js must be available in
+your Windows PATH. The updater stops if a step fails; it does not reset or
+discard local edits.
+
+Repository history was rewritten to remove committed credentials and browser
+data. An older checkout cannot update normally with `git pull --ff-only`.
+Close the app and clone a fresh copy into a new folder once:
 
 ```powershell
-git fetch origin
-git switch fix/gameflip-listing-flow
+cd "$env:USERPROFILE\Desktop"
+git clone https://github.com/dantemele3-star/Autoposter.git GameflipApp-clean
+cd GameflipApp-clean
+.\Update-Autoposter.cmd
 ```
 
-Close Autoposter before updating. Then double-click **Update-Autoposter.cmd** in
-this folder to pull the latest changes, install dependencies, and start the app.
-Git and Node.js must be available in your Windows PATH. The updater stops if a
-step fails; it does not reset or discard local edits. If Git reports conflicting
-local changes, resolve those changes before trying the update again.
+Keep any personal files from the old folder locally. Do not copy its `.git`,
+`.env`, or browser-cache folders into the fresh clone or push old branches back
+to GitHub. The app's Windows login profile remains outside the checkout in
+`AppData\Local\Gameflip_Ghost_Session`.
 
 You can also run the steps manually:
 
@@ -82,3 +90,16 @@ CI=1 CHROME_PATH=/usr/bin/chromium npm test
 
 Normal Electron startup requires a graphical desktop. The cloud tests validate
 the browser automation and GUI event handling without a Windows desktop session.
+
+## Keep account data local
+
+The app uses your Chrome login session; it does not need API keys or an `.env`
+file. Browser profiles, environment files, generated listing logs, and build
+outputs are excluded from Git. Revoke any Gameflip API credentials committed in
+the old history. Removing files from history does not revoke credentials or erase
+copies in other clones, forks, or GitHub caches.
+
+The unused API client dependencies, duplicate entry file, old renderer, generated
+listing log, and nonworking packaging command/configuration have been removed.
+This repository supports running from source with `npm start` and checking with
+`npm test`; portable installer packaging is not configured.

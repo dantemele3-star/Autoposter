@@ -165,5 +165,5 @@ async function waitForPublished(page, draftId) {
 
 module.exports = {
     listingId, findControl, clickElement, clickControl, navigate, dismissPopup,
-    deleteOldestListing, waitForPublished, parkPointer, settle
+    deleteOldestListing, waitForPublished, settle
 };

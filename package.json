@@ -1,24 +1,17 @@
 {
   "name": "gameflip-poster",
   "version": "1.0.0",
+  "private": true,
+  "engines": {
+    "node": ">=22.12.0"
+  },
   "main": "main.js",
   "scripts": {
     "start": "electron .",
-    "test": "node --test",
-    "dist": "electron-builder"
+    "test": "node --test"
   },
   "dependencies": {
     "electron": "^45.0.0",
     "puppeteer": "^25.16.0"
-  },
-  "build": {
-    "appId": "com.gameflip.poster",
-    "win": {
-      "target": "portable"
-    },
-    "files": [
-      "**/*",
-      "!node_modules/puppeteer/.local-chromium/**/*"
-    ]
   }
 }
