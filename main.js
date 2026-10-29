@@ -5,9 +5,10 @@ const fs = require('fs');
 const os = require('os');
 
 const {
-    listingId, findControl, clickElement, clickControl, navigate, dismissPopup,
+    listingId, clickControl, waitForControl, navigate, dismissPopup,
     deleteOldestListing, waitForPublished, settle
 } = require('./listing-controls');
+const { scanDrafts, openDraft } = require('./drafts');
 
 let shouldStop = false;
 let isRunning = false;
@@ -70,35 +71,8 @@ async function processDrafts(win, config) {
         }
 
         sendLog(win, "Scanning for all drafts across all pages...");
-        const processingQueue = [];
-        let currentPage = 1;
-        let hasMorePages = true;
-
-        while (hasMorePages) {
-            sendLog(win, `Scanning page ${currentPage}...`);
-            if (shouldStop) return { success: true, postedCount };
-            await navigate(page, `https://gameflip.com/listings/draft?page=${currentPage}`);
-
-            const pageDrafts = await page.$$('.tool-duplicate');
-            sendLog(win, `Found ${pageDrafts.length} drafts on page ${currentPage}.`);
-
-            for (let i = 0; i < pageDrafts.length; i++) {
-                processingQueue.push({ page: currentPage, index: i });
-            }
-
-            const nextExists = await page.evaluate(() => [...document.querySelectorAll('.pagination a, a[rel="next"]')]
-                .some(a => !a.closest('.disabled, [aria-disabled="true"]') &&
-                    (a.rel === 'next' || /^(next|›|»|>)$/i.test(a.textContent.trim()) ||
-                    /next/i.test(a.getAttribute('aria-label') || ''))));
-
-            if (nextExists && pageDrafts.length > 0) {
-                sendLog(win, `Moving to page ${currentPage + 1}...`);
-                currentPage++;
-            } else {
-                hasMorePages = false;
-                sendLog(win, "No more pages found.");
-            }
-        }
+        const processingQueue = await scanDrafts(page, message => sendLog(win, message), () => shouldStop);
+        if (shouldStop) return { success: true, postedCount };
 
         if (processingQueue.length === 0) {
             throw new Error("No drafts found. Please ensure you are on the Drafts page.");
@@ -121,29 +95,21 @@ async function processDrafts(win, config) {
             }
 
             const item = processingQueue[i];
-            sendLog(win, `\n📦 Processing Item ${i + 1}/${processingQueue.length} (Page ${item.page}, Index ${item.index + 1})...`);
+            sendLog(win, `\n📦 Processing Item ${i + 1}/${processingQueue.length} (Scanned page ${item.page}, row ${item.index + 1})...`);
 
-            await navigate(page, `https://gameflip.com/listings/draft?page=${item.page}`);
-
+            sendLog(win, 'Opening the selected draft copy...');
+            if (!await openDraft(page, item, message => sendLog(win, message), () => shouldStop)) break;
             await dismissPopup(page);
-
-            const currentButtons = await page.$$('.tool-duplicate');
-            if (currentButtons.length <= item.index) {
-                sendLog(win, " ⚠️ Item no longer at this position on page, skipping.");
-                continue;
-            }
-            const copyButton = currentButtons[item.index];
-
-            await clickElement(page, copyButton);
-            await settle(page);
-            await dismissPopup(page);
+            sendLog(win, 'Waiting for Done in the draft editor...');
             await clickControl(page, 'done');
             await settle(page);
             await dismissPopup(page);
             // Wait for the preview before capturing the new copy's ID.
-            const listReady = await page.waitForFunction(findControl, {}, 'list');
+            sendLog(win, 'Waiting for List Item in the listing preview...');
+            const listReady = await waitForControl(page, 'list');
             await listReady.dispose();
             const draftId = listingId(page.url());
+            sendLog(win, 'Submitting the listing...');
             await clickControl(page, 'list');
             const publishedId = await waitForPublished(page, draftId);
 

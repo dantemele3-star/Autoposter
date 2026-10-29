@@ -5,6 +5,7 @@ const path = require('node:path');
 const vm = require('node:vm');
 const puppeteer = require('puppeteer');
 const controls = require('../listing-controls');
+const drafts = require('../drafts');
 
 const OLD = '11111111-1111-4111-8111-111111111111';
 const RECENT = '22222222-2222-4222-8222-222222222222';
@@ -22,7 +23,7 @@ before(async () => {
 });
 after(async () => browser?.close());
 beforeEach(async () => {
-    state = { listings: [RECENT, OLD], visits: [], deleted: [], posts: 0, drafts: 1 };
+    state = { listings: [RECENT, OLD], visits: [], requests: [], deleted: [], published: [], posts: 0, drafts: 1 };
     page = await browser.newPage();
     const setTimeout = page.setDefaultTimeout.bind(page);
     page.setDefaultTimeout = ms => setTimeout(Math.min(ms, 1500));
@@ -31,6 +32,7 @@ beforeEach(async () => {
     page.on('request', async request => {
         const url = new URL(request.url());
         state.visits.push(url.pathname);
+        state.requests.push(url.href);
         let body;
         if (url.pathname === '/fixture/sorted') {
             await new Promise(resolve => global.setTimeout(resolve, 80));
@@ -38,7 +40,9 @@ beforeEach(async () => {
         } else if (url.pathname === '/fixture/publish') {
             if (!state.rejectPost) {
                 state.posts++;
+                state.published.push(url.searchParams.get('id'));
                 state.listings.unshift(url.searchParams.get('id'));
+                state.afterPost?.();
             }
             body = '{}';
         } else if (url.pathname === '/fixture/delete') {
@@ -60,11 +64,31 @@ function fixture(url) {
     const id = controls.listingId(url.href);
     let content = '';
     if (url.pathname === '/listings/draft') {
-        content = [NEW, NEXT].slice(0, state.drafts).map(id =>
-            `<a class="tool-duplicate" target="_blank" href="/listings/${id}/edit">Create a copy in Draft</a>`).join('');
-        content += '<ul class="pagination"><li class="disabled"><a aria-label="Next" href="?page=2">Next</a></li></ul>';
+        const pages = state.draftPages || [[NEW, NEXT].slice(0, state.drafts)];
+        const number = state.ignorePage ? 1 : Number(url.searchParams.get('page') || 1);
+        const ids = pages[number - 1] || [];
+        content = ids.map(id => state.copyWrapper
+            ? `<div data-listing-id="${id}"><a href="/item/source/${id}">Source draft</a>
+                <span class="tool-duplicate"><button onpointerdown="window.pressed=true"
+                    onclick="if(window.pressed) location.href='/listings/${id}/edit'">Copy</button></span></div>`
+            : `<a class="tool-duplicate" target="_blank" href="${state.sharedCopyLink ? '/listings/copy' : `/listings/${id}/edit` }"
+                ${state.blockCopy ? 'onclick="event.preventDefault()"' : ''}>Create a copy in Draft</a>`).join('');
+        if (state.pager === 'none') {
+            content += '<section><button disabled>Next</button></section>';
+        } else if (state.pager === 'buttons') {
+            content += `<div class="paginator"><button aria-label="Next page" ${number >= pages.length ? 'disabled' : ''}>›</button></div>`;
+        } else if (state.pager === 'numbers') {
+            content += '<div class="pagination">' + pages.map((_, index) =>
+                `<button ${index + 1 === number ? 'aria-current="page"' : ''}>${index + 1}</button>`).join('') + '</div>';
+        } else {
+            content += `<ul class="pagination"><li ${number >= pages.length ? 'class="disabled"' : ''}>
+                <a aria-label="Next" href="?page=${number + 1}&limit=50">Next</a></li></ul>`;
+        }
+        if (state.popup) content += '<div class="modal" role="dialog"><button onclick="this.parentElement.style.display=\'none\'">Not now</button></div>';
     } else if (url.pathname.endsWith('/edit')) {
-        content = `<button onclick="location.href='/listings/${id}/preview'">Done</button>`;
+        content = state.anchorDone
+            ? `<a class="btn" href="/listings/${id}/preview">Done</a>`
+            : `<button onclick="location.href='/listings/${id}/preview'">Done</button>`;
     } else if (url.pathname.endsWith('/preview')) {
         content = `<button onclick="fetch('/fixture/publish?id=${id}').then(() => {
             ${state.rejectPost ? "document.querySelector('#error').textContent='Post rejected'" : `location.href='/item/example/${id}'`}
@@ -106,7 +130,7 @@ function links(ids) {
     return ids.map(id => `<a target="_blank" href="${itemUrl(id)}">Listing ${id}</a>`).join('');
 }
 
-function mainProcess() {
+function mainProcess({ random = Math.random, skipWaits = false } = {}) {
     const handlers = new Map();
     const logs = [];
     const win = { isDestroyed: () => false, webContents: { send: (_, message) => logs.push(message) } };
@@ -117,10 +141,14 @@ function mainProcess() {
         BrowserWindow: { fromWebContents: () => win },
         ipcMain: { handle: (name, handler) => handlers.set(name, handler), on() {} }
     };
+    let clock = Date.now();
+    class TestClock extends Date { static now() { return clock += 300000; } }
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8'), {
         require: name => name === 'electron' ? electron : name === 'puppeteer'
-            ? { launch: async () => fakeBrowser } : name === './listing-controls' ? controls : require(name),
-        process, console, setTimeout: global.setTimeout
+            ? { launch: async () => fakeBrowser } : name === './listing-controls' ? controls
+                : name === './drafts' ? drafts : require(name),
+        process, console, setTimeout: global.setTimeout, Math: Object.create(Math, { random: { value: random } }),
+        Date: skipWaits ? TestClock : Date
     });
     return { handlers, logs, closed: () => closed };
 }
@@ -141,9 +169,157 @@ test('oldest deletion ignores navigation/profile menus and waits for sorted rows
     assert.equal(await page.$eval('#profile', el => el.matches(':hover')), false);
 });
 
+const sourceId = n => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
+const sourceIds = (start, count) => Array.from({ length: count }, (_, index) => sourceId(start + index));
+
+test('scans full pages without recognizable pagination and indexes every draft', async () => {
+    state.draftPages = [sourceIds(100, 50), sourceIds(150, 50), sourceIds(200, 3)];
+    state.pager = 'none';
+    const queue = await drafts.scanDrafts(page, () => {});
+    assert.equal(queue.length, 103);
+    assert.equal(new Set(queue.map(draft => draft.key)).size, 103);
+    assert.deepEqual(queue.at(-1), { key: sourceId(202), index: 2, page: 3 });
+    const requested = state.requests.map(value => new URL(value)).filter(url => url.pathname === '/listings/draft');
+    assert.deepEqual(requested.map(url => url.searchParams.get('page')), ['1', '2', '3']);
+    assert.ok(requested.every(url => url.searchParams.get('limit') === '50'));
+    assert.equal(state.posts, 0);
+});
+
+for (const pager of ['buttons', 'numbers']) {
+    test(`scans all drafts with ${pager} pagination and a short first page`, async () => {
+        state.draftPages = [[NEW, NEXT], [sourceId(500)]];
+        state.pager = pager;
+        const queue = await drafts.scanDrafts(page, () => {});
+        assert.deepEqual(queue.map(draft => draft.key), [NEW, NEXT, sourceId(500)]);
+        assert.equal(queue.at(-1).page, 2);
+    });
+}
+
+test('an exact multiple of 50 is completed by checking the following empty page', async () => {
+    state.draftPages = [sourceIds(100, 50), sourceIds(150, 50)];
+    state.pager = 'none';
+    const queue = await drafts.scanDrafts(page, () => {});
+    assert.equal(queue.length, 100);
+    assert.ok(state.requests.some(value => new URL(value).searchParams.get('page') === '3'));
+});
+
+test('a server that repeats page one pauses before posting any partial queue', async () => {
+    state.draftPages = [sourceIds(100, 50)];
+    state.pager = 'none';
+    state.ignorePage = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /page 2 repeated/);
+    assert.equal(result.postedCount, 0);
+    assert.equal(state.posts, 0);
+    assert.equal(state.visits.some(value => value.endsWith('/edit')), false);
+});
+
+test('ambiguous copy links pause during scanning instead of collapsing the queue to one item', async () => {
+    state.drafts = 2;
+    state.sharedCopyLink = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /Multiple draft rows share the same identity/);
+    assert.equal(result.postedCount, 0);
+    assert.equal(main.logs.some(message => message.includes('Processing Item')), false);
+});
+
+test('Stop during a multi-page scan returns no posting queue', async () => {
+    state.draftPages = [sourceIds(100, 50), sourceIds(150, 50), [sourceId(200)]];
+    state.pager = 'none';
+    let stopped = false;
+    const queue = await drafts.scanDrafts(page, message => {
+        if (message === 'Found 50 drafts on page 2.') stopped = true;
+    }, () => stopped);
+    assert.deepEqual(queue, []);
+    assert.equal(state.posts, 0);
+});
+
+test('selects the original draft ID after a new row shifts its scanned index', async () => {
+    const queue = await drafts.scanDrafts(page, () => {});
+    state.draftPages = [[sourceId(900), NEW]];
+    await drafts.openDraft(page, queue[0], () => {});
+    assert.equal(page.url(), `https://gameflip.com/listings/${NEW}/edit`);
+});
+
+test('two consecutive posts still use the original queue when drafts move between pages', async () => {
+    state.draftPages = [[NEW], [NEXT]];
+    state.afterPost = () => {
+        if (state.posts === 1) state.draftPages = [[NEXT, sourceId(900)], [NEW]];
+    };
+    const main = mainProcess({ skipWaits: true });
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 2);
+    assert.deepEqual(state.published, [NEW, NEXT]);
+    assert.ok(main.logs.some(message => message.includes('locating it by listing ID')));
+});
+
+test('finishes all 53 drafts before randomizing and opening a draft from page two', async () => {
+    state.draftPages = [sourceIds(100, 50), sourceIds(150, 3)];
+    state.pager = 'none';
+    let randomCalls = 0;
+    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999 });
+    let outcome;
+    const run = main.handlers.get('process-drafts')({ sender: {} }, { randomize: true })
+        .then(result => { outcome = result; return result; });
+    try {
+        const deadline = Date.now() + 15000;
+        while (!main.logs.some(message => message.includes('Rate Limit Protection'))) {
+            assert.equal(outcome, undefined, outcome?.error || 'Run ended before processing the full queue');
+            assert.ok(Date.now() < deadline, 'Did not reach the inter-post wait');
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+    } finally {
+        await main.handlers.get('stop-drafts')();
+        await run;
+    }
+    assert.equal(outcome.success, true, outcome.error);
+    assert.equal(outcome.postedCount, 1);
+    assert.deepEqual(state.published, [sourceId(152)]);
+    const complete = main.logs.findIndex(message => message.includes('Scan complete: 53 unique drafts'));
+    assert.ok(complete >= 0);
+    assert.ok(complete < main.logs.findIndex(message => message.includes('Randomizing processing order')));
+    assert.ok(complete < main.logs.findIndex(message => message.includes('Processing Item 1/53')));
+    const requests = state.requests.map(value => new URL(value));
+    const pageTwo = requests.findIndex(url => url.pathname === '/listings/draft' && url.searchParams.get('page') === '2');
+    const firstCopy = requests.findIndex(url => url.pathname.endsWith('/edit'));
+    assert.ok(pageTwo >= 0 && pageTwo < firstCopy);
+});
+
+test('clicks the real copy button inside its wrapper and accepts an anchor Done control', async () => {
+    state.copyWrapper = true;
+    state.anchorDone = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+});
+
+test('dismisses a promotion modal before clicking the draft copy control', async () => {
+    state.popup = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+});
+
+test('a copy action that stays on Drafts identifies the exact missing step', async () => {
+    state.blockCopy = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.match(result.error, /Done control in the draft editor on \/listings\/draft/);
+    assert.equal(result.postedCount, 0);
+    assert.equal(state.posts, 0);
+});
+
 test('missing Oldest option stops without deleting any listing', async () => {
     state.sortBroken = true;
-    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /Waiting failed/);
+    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /Oldest option/);
     assert.deepEqual(state.deleted, []);
 });
 

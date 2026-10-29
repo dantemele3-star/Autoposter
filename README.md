@@ -53,6 +53,20 @@ Choose settings before starting; settings stay locked while a run is active.
 Stop finishes the current item, including any required count maintenance, and
 interrupts the wait before the next post.
 
+## Scan and select drafts
+
+Each cycle scans `/listings/draft?page=1&limit=50`, page 2, and subsequent
+pages before randomizing or posting. A full page is followed even if Gameflip's
+Next control is not recognized. The log prints **Scan complete** with the total
+number of unique drafts before posting begins. Repeated pages or failed requests
+pause the run rather than post from an incomplete scan.
+
+Drafts are identified by their listing IDs or unique copy links. If creating a
+copy shifts the rows or moves a draft to another page, the app locates the
+original draft again instead of clicking its old row number. Newly appearing
+drafts are picked up in the next cycle. The log names the copy, Done, preview,
+and submission steps so a timeout identifies which step failed.
+
 ## Maintain listing count
 
 With **Delete Oldest Listing** checked, the app verifies that the new listing was
@@ -76,7 +90,8 @@ npm test
 
 Tests launch an isolated headless browser and intercept all network requests with
 local page fixtures. They cover the checkbox, competing profile/navigation
-menus, delayed sorting, posting and deletion failures, single-tab actions,
+menus, multi-page draft scanning, shifted row positions, consecutive posts,
+delayed sorting, posting and deletion failures, single-tab actions,
 overlapping runs, stopping, and loop rate limiting. They do not use your login
 profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.
