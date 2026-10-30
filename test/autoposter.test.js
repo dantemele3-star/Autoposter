@@ -61,6 +61,10 @@ beforeEach(async () => {
             state.deleted.push(id);
             if (!state.rejectDelete) state.listings = state.listings.filter(value => value !== id);
             body = '{}';
+        } else if (url.pathname === '/fixture/decline' || url.pathname === '/fixture/accept') {
+            const key = url.pathname.endsWith('/decline') ? 'declines' : 'accepts';
+            state[key] = (state[key] || 0) + 1;
+            body = '{}';
         } else {
             body = fixture(url);
         }
@@ -107,10 +111,24 @@ function fixture(url) {
             ? `<a class="btn" href="${preview}">Done</a>`
             : `<button onclick="location.href='${preview}'">Done</button>`;
     } else if (url.pathname.endsWith('/preview')) {
-        content = `<button onclick="fetch('/fixture/publish?id=${id}').then(() => {
-            ${state.rejectPost ? "document.querySelector('#error').textContent='Post rejected'" : state.stayPreview
-                ? '' : state.publishToOnSale ? "location.href='/listings/onsale'" : `location.href='/item/example/${id}'`}
-        })">List Item</button><div id="error" role="alert"></div>`;
+        const prompt = state.postPopup === 'iframe'
+            ? '<iframe id="notification-frame" src="https://notifications.example.test/notification-prompt" style="position:fixed;inset:10px;width:500px;height:300px"></iframe>'
+            : notificationPrompt(state.stickyPrompt ? '' : 'declinePrompt()', state.postPopup === 'custom');
+        content = `<button onclick="submitFixtureListing()">List Item</button><div id="error" role="alert"></div>
+            <script>
+                function declinePrompt() { fetch('/fixture/decline').then(() => location.href='/listings/onsale'); }
+                window.addEventListener('message', event => { if(event.data === 'declined') {
+                    document.querySelector('#notification-frame').remove(); declinePrompt();
+                }});
+                async function submitFixtureListing() {
+                    await fetch('/fixture/publish?id=${id}');
+                    ${state.rejectPost ? "document.querySelector('#error').textContent='Post rejected'" : state.postPopup
+                        ? `setTimeout(() => document.body.insertAdjacentHTML('beforeend', ${JSON.stringify(prompt)}), ${state.popupDelay || 0});`
+                        : state.stayPreview ? '' : state.publishToOnSale ? "location.href='/listings/onsale'" : `location.href='/item/example/${id}'`}
+                }
+            </script>`;
+    } else if (url.pathname === '/notification-prompt') {
+        content = notificationPrompt("parent.postMessage('declined', '*')");
     } else if (url.pathname === '/listings/onsale') {
         const saleIds = state.salePages ? state.salePages[Number(url.searchParams.get('page') || 1) - 1] || [] : state.listings;
         content = `${state.saleListButton ? '<button>List Item</button>' : ''}<div class="dropdown" id="sort">
@@ -126,6 +144,7 @@ function fixture(url) {
                     '<a href="/item/example/' + id + '">Listing ' + id + '</a>').join('');
             }
         </script>`;
+        if (state.salePopup) content += notificationPrompt("fetch('/fixture/decline'); this.closest('.notification-prompt').remove()");
     } else if (id) {
         content = `<div class="dropdown" id="actions">
             <button onclick="this.parentElement.classList.toggle('open')"><span class="fa-power-off">Power</span></button>
@@ -149,6 +168,14 @@ function links(ids) {
     return ids.map(id => `<a target="_blank" href="${itemUrl(id)}">Listing ${id}</a>`).join('');
 }
 
+function notificationPrompt(decline, custom = false) {
+    const tag = custom ? 'div' : 'button';
+    return `<div class="notification-prompt" style="position:fixed;inset:20px;background:#252225;z-index:1000">
+        <div>BE THE FIRST!</div><p>Receive instant order updates, account alerts and special discounts?</p>
+        <div><button onclick="fetch('/fixture/accept')">YES</button>
+            <${tag} onclick="${decline}"><span>NOT</span> <span>NOW</span></${tag}></div></div>`;
+}
+
 function mainProcess({ random = Math.random, skipWaits = false, stateFolder, launchError, closeError } = {}) {
     if (!stateFolder) {
         stateFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'autoposter-state-test-'));
@@ -156,6 +183,7 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
     }
     const handlers = new Map();
     const logs = [];
+    const openedLogs = [];
     const win = { isDestroyed: () => false, webContents: { send: (_, message) => logs.push(message) } };
     let closed = false;
     const fakeBrowser = Object.assign(new EventEmitter(), { pages: async () => [page], close: async () => {
@@ -165,7 +193,9 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
     const electron = {
         app: { getPath: () => stateFolder, whenReady: () => ({ then() {} }), requestSingleInstanceLock: () => true, quit() {} },
         BrowserWindow: { fromWebContents: () => win },
-        ipcMain: { handle: (name, handler) => handlers.set(name, handler), on() {} }
+        ipcMain: { handle: (name, handler) => handlers.set(name, handler), on() {} },
+        shell: { showItemInFolder: file => openedLogs.push(['file', file]),
+            openPath: async folder => { openedLogs.push(['folder', folder]); return ''; } }
     };
     let clock = Date.now();
     class TestClock extends Date { static now() { return clock += 300000; } }
@@ -179,7 +209,7 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
         process, console, setTimeout: global.setTimeout, Math: Object.create(Math, { random: { value: random } }),
         Date: skipWaits ? TestClock : Date
     });
-    return { handlers, logs, stateFolder, closed: () => closed };
+    return { handlers, logs, stateFolder, openedLogs, closed: () => closed };
 }
 
 test('oldest deletion ignores navigation/profile menus and waits for sorted rows', async () => {
@@ -454,6 +484,82 @@ test('dismisses a promotion modal before clicking the draft copy control', async
     assert.equal(result.postedCount, 1);
 });
 
+for (const kind of ['inline', 'custom', 'iframe']) {
+    test(`dismisses a late BE THE FIRST notification ${kind} after posting without resubmitting`, async () => {
+        state.postPopup = kind;
+        state.popupDelay = 250;
+        const main = mainProcess();
+        const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+        assert.equal(result.success, true, `${result.error}\n${main.logs.join('\n')}`);
+        assert.equal(result.postedCount, 1);
+        assert.equal(state.posts, 1);
+        assert.equal(state.declines, 1);
+        assert.equal(state.accepts || 0, 0);
+        assert.deepEqual(state.deleted, []);
+        assert.ok(main.logs.some(message => message.includes('popup detected')));
+        assert.ok(main.logs.some(message => message.includes('popup dismissal confirmed')));
+        assert.match(fs.readFileSync(path.join(main.stateFolder, 'autoposter.log'), 'utf8'), /popup dismissal confirmed/);
+    });
+}
+
+test('post-publication and On Sale notification prompts do not prevent oldest-listing maintenance', async () => {
+    state.postPopup = 'inline';
+    state.salePopup = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+    assert.equal(result.success, true, `${result.error}\n${main.logs.join('\n')}`);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.equal(state.listings.length, 2);
+    assert.equal(state.accepts || 0, 0);
+});
+
+test('a notification popup that cannot be dismissed stops with the original submission preserved', async () => {
+    state.postPopup = 'inline';
+    state.stickyPrompt = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+    assert.equal(result.success, false);
+    assert.match(result.error, /notification popup stayed visible/);
+    assert.equal(state.posts, 1);
+    assert.equal(result.postedCount, 0);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json'))).submissions.length, 1);
+    assert.deepEqual(state.deleted, []);
+});
+
+test('a popup that appears while waiting for Done is dismissed with the click delay preserved', async () => {
+    setPagePacer(page);
+    page.getDefaultTimeout = () => 10000;
+    await page.setContent('<button id="done" style="display:none" onclick="window.doneAt=performance.now()">Done</button>');
+    const markup = notificationPrompt("window.dismissedAt=performance.now(); document.querySelector('#done').style.display='block'; this.closest('.notification-prompt').remove()");
+    await page.evaluate(html => setTimeout(() => document.body.insertAdjacentHTML('beforeend', html), 100), markup);
+    await controls.clickControl(page, 'done');
+    const timing = await page.evaluate(() => ({ done: window.doneAt, dismissed: window.dismissedAt }));
+    assert.ok(timing.done - timing.dismissed >= 1990, JSON.stringify(timing));
+});
+
+test('unrelated Not Now controls and hidden notification iframes are left alone', async () => {
+    const markup = notificationPrompt("window.incorrectlyDismissed=true");
+    await page.setContent('<button onclick="window.incorrectlyDismissed=true">Not Now</button><iframe style="display:none"></iframe>');
+    const frame = page.frames().find(frame => frame !== page.mainFrame());
+    await frame.setContent(markup);
+    assert.equal(await controls.dismissPopup(page), false);
+    assert.equal(await page.evaluate(() => Boolean(window.incorrectlyDismissed)), false);
+    assert.equal(await frame.evaluate(() => Boolean(window.incorrectlyDismissed)), false);
+});
+
+test('the log-folder action opens the saved file independently of posting', async () => {
+    const main = mainProcess();
+    assert.equal((await main.handlers.get('open-logs')()).success, true);
+    assert.deepEqual(main.openedLogs.at(-1), ['folder', main.stateFolder]);
+    const file = path.join(main.stateFolder, 'autoposter.log');
+    fs.writeFileSync(file, 'Previously saved run');
+    assert.equal((await main.handlers.get('open-logs')()).success, true);
+    assert.deepEqual(main.openedLogs.at(-1), ['file', file]);
+    assert.equal(state.posts, 0);
+});
+
 test('a copy action that stays on Drafts identifies the exact missing step', async () => {
     state.blockCopy = true;
     const main = mainProcess();
@@ -695,7 +801,7 @@ test('the GUI captures the checkbox and locks settings until posting finishes', 
     await page.evaluate(() => {
         window.calls = [];
         window.require = () => ({ clipboard: { writeText: text => { window.copiedLogs = text; } }, ipcRenderer: {
-            on() {}, send() {},
+            on: (_, callback) => { window.receiveLog = callback; }, send() {},
             invoke: async (channel, config) => {
                 window.calls.push({ channel, config });
                 if (channel === 'process-drafts') return new Promise(resolve => window.finishRun = resolve);
@@ -716,4 +822,12 @@ test('the GUI captures the checkbox and locks settings until posting finishes', 
     assert.equal(await page.$eval('#maintainLimit', el => el.checked), true);
     await page.click('#copyLogs');
     assert.match(await page.evaluate(() => window.copiedLogs), /paused after 1 confirmed posts: Deletion not confirmed/);
+    await page.click('#openLogs');
+    assert.equal(await page.evaluate(() => window.calls.at(-1).channel), 'open-logs');
+    await page.evaluate(() => {
+        for (let i = 0; i < 2100; i++) window.receiveLog(null, `Message ${i}`);
+    });
+    await page.waitForFunction(() => document.querySelector('#logContainer').childNodes.length === 2000);
+    await page.click('#copyLogs');
+    assert.match(await page.evaluate(() => window.copiedLogs), /Message 2099/);
 });

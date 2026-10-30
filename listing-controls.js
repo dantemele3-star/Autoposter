@@ -51,7 +51,21 @@ function findControl(action) {
         case 'confirm': return buttons.find(el => el.closest('.modal, [role="dialog"]') && /^delete(?: (?:item|listing))?$/i.test(text(el)));
         case 'done': return buttons.find(el => /^done\b/i.test(text(el)));
         case 'list': return buttons.find(el => /^list item$/i.test(text(el)));
-        case 'dismiss': return buttons.find(el => el.closest('.modal, [role="dialog"]') && /^(not now|maybe later)$/i.test(text(el)));
+        case 'dismiss': {
+            // Push widgets sometimes implement their decline button as a div.
+            const candidates = [...buttons, ...[...document.querySelectorAll('div, span')].reverse()
+                .filter(el => visible(el) && content(el) && el.getAttribute('aria-disabled') !== 'true')];
+            return candidates.find(el => {
+                if (!/^(?:not\s*now|maybe\s+later)$/i.test(text(el))) return false;
+                if (el.closest('.modal, dialog, [role="dialog"], [aria-modal="true"]')) return true;
+                // Some notification widgets use ordinary divs rather than dialogs.
+                for (let container = el.parentElement, depth = 0; container && container !== document.body && depth < 8;
+                    container = container.parentElement, depth++) {
+                    if (/\bbe the first\b|receive instant order updates|account alerts and special discounts/i.test(container.innerText || '')) return true;
+                }
+                return false;
+            });
+        }
     }
 }
 
@@ -84,9 +98,35 @@ async function clickElement(page, element, { useMouse = false, verify, beforeCli
     }
 }
 
-async function waitForControl(page, action) {
+const sleep = ms => new Promise(resolve => setTimeout(resolve, ms));
+function changingContext(error) {
+    for (let current = error, depth = 0; current && depth < 4; current = current.cause, depth++) {
+        if (/execution context was destroyed|cannot find context|detached frame|frame (?:was|got) detached|JSHandles can be evaluated only in the context/i.test(current.message || '')) return true;
+    }
+    return false;
+}
+
+async function waitWithPopups(page, predicate, args, timeoutMs) {
+    const deadline = timeoutMs ? Date.now() + timeoutMs : Infinity;
+    do {
+        try {
+            await dismissPopup(page);
+            const result = await page.evaluateHandle(predicate, ...args);
+            if (await result.evaluate(value => Boolean(value))) return result;
+            await result.dispose();
+        } catch (error) {
+            if (!changingContext(error)) throw error;
+        }
+        await sleep(Math.min(250, Math.max(0, deadline - Date.now())));
+    } while (Date.now() < deadline);
+    const error = new Error(`Waiting failed: ${timeoutMs}ms exceeded`);
+    error.name = 'TimeoutError';
+    throw error;
+}
+
+async function waitForControl(page, action, timeoutMs = page.getDefaultTimeout()) {
     try {
-        return await page.waitForFunction(findControl, {}, action);
+        return await waitWithPopups(page, findControl, [action], timeoutMs);
     } catch (error) {
         if (error.name !== 'TimeoutError') throw error;
         const labels = { sort: 'Created sort dropdown', sorted: 'Created: Oldest sort result',
@@ -98,23 +138,56 @@ async function waitForControl(page, action) {
 }
 
 async function clickControl(page, action, options) {
-    await paceAction(page);
-    const handle = await waitForControl(page, action);
-    try {
-        await clickElement(page, handle.asElement(), { ...options, paced: true });
-    } finally {
-        await handle.dispose();
+    const timeout = page.getDefaultTimeout();
+    const deadline = timeout ? Date.now() + timeout : Infinity;
+    do {
+        const ready = await waitForControl(page, action, Math.max(1, deadline - Date.now()));
+        await ready.dispose();
+        await paceAction(page);
+        if (await dismissPopup(page)) continue;
+        // A popup or the action pause may have caused a render. Resolve again.
+        const handle = await page.evaluateHandle(findControl, action);
+        try {
+            if (handle.asElement()) {
+                await clickElement(page, handle.asElement(), { ...options, paced: true });
+                return;
+            }
+        } finally { await handle.dispose(); }
+    } while (Date.now() < deadline);
+    throw new Error(`The ${action} control kept changing while popups were being dismissed; posting paused.`);
+}
+
+async function popupControl(page) {
+    for (const frame of page.frames()) {
+        try {
+            if (frame !== page.mainFrame()) {
+                const element = await frame.frameElement();
+                let visible;
+                try { visible = element && await element.evaluate(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden'); }
+                finally { await element?.dispose(); }
+                if (!visible) continue;
+            }
+            const handle = await frame.evaluateHandle(findControl, 'dismiss');
+            if (handle.asElement()) return { frame, handle };
+            await handle.dispose();
+        } catch (error) {
+            if (!changingContext(error)) throw error;
+        }
     }
+    return null;
 }
 
 async function settle(page) {
+    await dismissPopup(page);
     await page.waitForNetworkIdle({ idleTime: 500 });
+    await dismissPopup(page);
 }
 
 async function navigate(page, url) {
     await paceAction(page);
     const response = await page.goto(url, { waitUntil: 'domcontentloaded' });
     await parkPointer(page);
+    completeAction(page);
     await settle(page);
     completeAction(page);
     return response;
@@ -127,20 +200,40 @@ function usablePageResponse(response) {
 }
 
 async function dismissPopup(page) {
-    const initial = await page.evaluateHandle(findControl, 'dismiss');
-    const present = Boolean(initial.asElement());
-    await initial.dispose();
-    if (!present) return;
-    await paceAction(page);
-    const handle = await page.evaluateHandle(findControl, 'dismiss');
-    try {
-        if (handle.asElement()) {
-            await clickElement(page, handle.asElement(), { paced: true });
-            await settle(page);
-        }
-    } finally {
-        await handle.dispose();
+    let dismissed = false;
+    for (let attempt = 0; attempt <= 3; attempt++) {
+        const initial = await popupControl(page);
+        if (!initial) return dismissed;
+        await initial.handle.dispose();
+        if (attempt === 3) throw new Error('Notification/promotion popups kept reappearing; posting paused.');
+        page.emit('automation-popup', 'Notification/promotion popup detected; selecting Not Now/Maybe Later...');
+        await paceAction(page);
+        const current = await popupControl(page);
+        if (!current) return dismissed;
+        const { frame, handle } = current;
+        try {
+            const beforeUrl = frame.url();
+            const leftFrame = () => !page.isClosed() &&
+                (frame.detached || !page.frames().includes(frame) || frame.url() !== beforeUrl);
+            try {
+                await clickElement(page, handle.asElement(), { paced: true });
+                const deadline = Date.now() + 5000;
+                while (!leftFrame()) {
+                    if (await handle.evaluate(el => !el.isConnected || !el.getClientRects().length || getComputedStyle(el).visibility === 'hidden')) break;
+                    if (Date.now() >= deadline) throw new Error('Not Now/Maybe Later was clicked, but the notification popup stayed visible; posting paused.');
+                    await sleep(100);
+                }
+            } catch (error) {
+                // An out-of-process iframe may remove itself during its click.
+                // Allow its detach event to arrive; a closed main page is an error.
+                if (frame !== page.mainFrame() && !page.isClosed() && /target closed/i.test(error.message)) await sleep(50);
+                if (!changingContext(error) && !leftFrame()) throw error;
+            }
+            dismissed = true;
+            page.emit('automation-popup', '✅ Notification/promotion popup dismissal confirmed.');
+        } finally { await handle.dispose(); }
     }
+    return dismissed;
 }
 
 async function activeListingLinks(page) {
@@ -265,7 +358,7 @@ async function waitForPublished(page, context, {
     const deadline = Date.now() + timeoutMs;
     let state;
     try {
-        const result = await page.waitForFunction(publicationDOM, { timeout: timeoutMs, polling: 250 }, context);
+        const result = await waitWithPopups(page, publicationDOM, [context], timeoutMs);
         try { state = await result.jsonValue(); } finally { await result.dispose(); }
     } catch (error) {
         if (error.name !== 'TimeoutError') throw error;

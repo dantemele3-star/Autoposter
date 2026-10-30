@@ -56,6 +56,12 @@ test('an unwritable log warns once and keeps the visible run log available', () 
     assert.equal(messages.filter(message => message.includes('Could not save')).length, 1);
 });
 
+test('a broken app-window log channel still saves the diagnostic log', () => {
+    const log = new RunLog(file, () => { throw new Error('Window unavailable'); });
+    log.write('Saved despite the closed window');
+    assert.match(fs.readFileSync(file, 'utf8'), /Saved despite the closed window/);
+});
+
 test('navigation diagnostics describe 304 and detach before intentional browser cleanup', async () => {
     const page = new EventEmitter();
     const browser = new EventEmitter();

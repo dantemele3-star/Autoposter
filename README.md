@@ -79,6 +79,13 @@ also include page readiness, visible action controls, and recent browser or
 Gameflip request failures. Normal session cleanup is logged separately from an
 unexpected browser disconnect.
 
+**Open Logs Folder** reveals the saved log even while posting is running. If the
+app window is stuck or closed, press Win+R and open
+`%APPDATA%\gameflip-poster\autoposter.log` directly, then attach that file when
+reporting the failure. Logs are stored on your PC and are not automatically
+uploaded to this cloud workspace. The on-screen log keeps the latest 2,000
+messages; the saved files retain the rotating history described below.
+
 Logs are also saved across restarts to `%APPDATA%\gameflip-poster\autoposter.log`
 on Windows. The app prints the actual path at startup. At 1 MiB it rotates to
 `autoposter.log.previous`, retaining at most these two files. If saving fails,
@@ -103,6 +110,13 @@ error. Check Gameflip before restarting after an uncertain publication, to avoid
 posting a duplicate. The pointer is moved out of the header before actions, and
 profile menus and section navigation links are excluded from deletion targets.
 ## Timing and posting limits
+
+The app selects **Not Now** on the "Be the first!" notification prompt, including
+when it appears after submission, during an editor wait, or inside a visible
+iframe. Recognized promotion dialogs with **Maybe Later** are also dismissed.
+Every dismissal is logged and checked before continuing. A prompt that stays
+visible pauses the run with a specific error. Publication is still verified by
+listing ID; dismissing a prompt does not submit the listing again.
 
 Navigation and clicks are separated by at least two seconds after the previous
 action completes. Controls must also be ready before they are clicked. After

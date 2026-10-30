@@ -214,8 +214,8 @@
             box-shadow: inset 0 2px 10px rgba(0,0,0,0.5);
         }
 
-        .log-toolbar { display: flex; justify-content: flex-end; margin-bottom: 8px; }
-        #copyLogs { flex: none; padding: 6px 12px; font-size: 12px; background: var(--panel-bg); }
+        .log-toolbar { display: flex; justify-content: flex-end; gap: 8px; margin-bottom: 8px; }
+        .log-toolbar button { flex: none; padding: 6px 12px; font-size: 12px; background: var(--panel-bg); }
 
         /* Custom Scrollbar */
         #logContainer::-webkit-scrollbar { width: 8px; }
@@ -268,7 +268,7 @@
             <button id="stopBtn"><span>🛑</span> Stop Posting</button>
         </div>
         
-        <div class="log-toolbar"><button id="copyLogs">Copy Logs</button></div>
+        <div class="log-toolbar"><button id="openLogs">Open Logs Folder</button><button id="copyLogs">Copy Logs</button></div>
         <div id="logContainer" role="log">Ready to launch...</div>
     </div>
 
@@ -279,10 +279,19 @@
         const stopBtn = document.getElementById('stopBtn');
         const logContainer = document.getElementById('logContainer');
         const settings = [...document.querySelectorAll('.settings-grid input')];
+        const pendingLogs = [];
+        let logFrame = null;
         document.getElementById('copyLogs').addEventListener('click', event => {
-            clipboard.writeText(logContainer.innerText);
+            flushLogs();
+            clipboard.writeText(logContainer.textContent);
             event.currentTarget.textContent = 'Copied';
             setTimeout(() => document.getElementById('copyLogs').textContent = 'Copy Logs', 2000);
+        });
+        document.getElementById('openLogs').addEventListener('click', async () => {
+            try {
+                const result = await ipcRenderer.invoke('open-logs');
+                if (!result.success) appendLog(`Could not open the logs folder: ${result.error}`);
+            } catch (error) { appendLog(`Could not open the logs folder: ${error.message}`); }
         });
 
         // Window Controls
@@ -292,7 +301,19 @@
 
         function appendLog(msg) {
             const timestamp = new Date().toLocaleTimeString([], { hour12: false, hour: '2-digit', minute: '2-digit', second: '2-digit' });
-            logContainer.innerText += `[${timestamp}] ${msg}\n`;
+            pendingLogs.push(`[${timestamp}] ${msg}\n`);
+            if (pendingLogs.length > 2000) pendingLogs.shift();
+            if (logFrame === null) logFrame = requestAnimationFrame(flushLogs);
+        }
+
+        function flushLogs() {
+            if (logFrame !== null) cancelAnimationFrame(logFrame);
+            logFrame = null;
+            if (!pendingLogs.length) return;
+            const fragment = document.createDocumentFragment();
+            for (const line of pendingLogs.splice(0)) fragment.appendChild(document.createTextNode(line));
+            logContainer.appendChild(fragment);
+            while (logContainer.childNodes.length > 2000) logContainer.firstChild.remove();
             logContainer.scrollTop = logContainer.scrollHeight;
         }
 
@@ -301,7 +322,8 @@
         });
 
         startBtn.addEventListener('click', async () => {
-            logContainer.innerText = "🚀 Initializing Ghost Session... Please wait.\n";
+            pendingLogs.length = 0;
+            logContainer.textContent = "🚀 Initializing Ghost Session... Please wait.\n";
             startBtn.style.display = "none";
             stopBtn.style.display = "block";
             settings.forEach(input => input.disabled = true);

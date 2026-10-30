@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain } = require('electron');
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const puppeteer = require('puppeteer');
 const path = require('path');
 const fs = require('fs');
@@ -213,6 +213,20 @@ ipcMain.handle('stop-drafts', async () => {
     console.log("🛑 Stop signal sent from GUI...");
     shouldStop = true;
     return { success: true };
+});
+
+ipcMain.handle('open-logs', async () => {
+    try {
+        const folder = app.getPath('userData');
+        const file = path.join(folder, 'autoposter.log');
+        fs.mkdirSync(folder, { recursive: true });
+        if (fs.existsSync(file)) {
+            shell.showItemInFolder(file);
+            return { success: true };
+        }
+        const error = await shell.openPath(folder);
+        return { success: !error, error };
+    } catch (error) { return { success: false, error: redact(error.message) }; }
 });
 
 if (!app.requestSingleInstanceLock()) {

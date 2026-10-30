@@ -36,7 +36,8 @@ class RunLog {
 
     write(message) {
         const clean = redact(message).slice(0, 6000);
-        this.send(clean);
+        // A closed or unresponsive app window must not prevent saving the log.
+        try { this.send(clean); } catch {}
         if (this.fileUnavailable) return;
         try {
             fs.mkdirSync(path.dirname(this.file), { recursive: true });
@@ -47,7 +48,7 @@ class RunLog {
             fs.appendFileSync(this.file, `[${new Date().toISOString()}] ${clean}\n`, { mode: 0o600 });
         } catch (error) {
             this.fileUnavailable = true;
-            this.send(`⚠️ Could not save the diagnostic log (${error.code || 'file error'}). Use Copy Logs to keep this run's details.`);
+            try { this.send(`⚠️ Could not save the diagnostic log (${error.code || 'file error'}). Use Copy Logs to keep this run's details.`); } catch {}
         }
     }
 
@@ -89,6 +90,7 @@ class RunLog {
         });
         on(page, 'pageerror', error => note(`Page script: ${error.message}`));
         on(page, 'error', error => note(`Browser page crash: ${error.message}`));
+        on(page, 'automation-popup', message => this.write(message));
         on(page, 'close', () => note('Browser page closed unexpectedly.'));
         on(browser, 'disconnected', () => note('Chrome disconnected unexpectedly.'));
     }
@@ -126,6 +128,9 @@ class RunLog {
         }
         for (const note of this.notes) this.write(`Recent browser/network issue: ${note}`);
         if (error.stack) this.write(`Error details:\n${error.stack.split('\n').slice(0, 6).join('\n')}`);
+        for (let cause = error.cause, depth = 0; cause && depth < 3; cause = cause.cause, depth++) {
+            this.write(`Caused by: ${cause.name || 'Error'}: ${cause.message || String(cause)}`);
+        }
         this.write(`Diagnostic log: ${this.file}`);
     }
 }
