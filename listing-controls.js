@@ -32,8 +32,36 @@ function findControl(action) {
         .filter(el => visible(el) && content(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true');
     const sort = () => buttons.find(el => el.matches('.dropdown-toggle') && /created\s*:/i.test(text(el)));
     const menuFor = el => el?.closest('.dropdown, .btn-group')?.querySelector('.dropdown-menu');
-    const power = () => [...document.querySelectorAll('.fa-power-off')].find(el => visible(el) && content(el));
-    const clickable = el => el?.closest('button, a, [role="button"]') || el;
+    const enabled = el => !el.disabled && el.getAttribute('aria-disabled') !== 'true';
+    const listingMenu = () => {
+        if (!/^\/item\//.test(location.pathname)) return null;
+        const menuSelector = '.dropdown-menu, [role="menu"]';
+        const candidates = [];
+        for (const menu of document.querySelectorAll(menuSelector)) {
+            if (!content(menu) || menu.closest('.comment, .review, [data-comment-id], [data-review-id]')) continue;
+            const entries = [...menu.querySelectorAll('a, button, [role="menuitem"], [role="button"]')]
+                .filter(el => el.closest(menuSelector) === menu);
+            // Reject account menus even if the site's header markup changes.
+            if (entries.some(el => /\b(?:log\s*out|sign\s*out|my\s+profile)\b/i.test(text(el)) ||
+                /\/(?:logout|signout|profile|settings)(?:[/?#]|$)/i.test(el.getAttribute('href') || ''))) continue;
+            // The Delete entry identifies the seller menu, including while it
+            // is hidden. Icons (power, ellipsis, gear, SVG) are not identities.
+            const deletes = entries.filter(el => enabled(el) && /^delete(?: (?:item|listing))?$/i.test(text(el) || el.getAttribute('title') || ''));
+            if (deletes.length !== 1) continue;
+            const toggles = [...new Set([...buttons, ...document.querySelectorAll('.dropdown-toggle, [data-toggle="dropdown"], [data-bs-toggle="dropdown"]')])].filter(el => {
+                if (!visible(el) || !content(el) || !enabled(el)) return false;
+                if (menu.contains(el)) return false;
+                const ids = `${el.getAttribute('aria-controls') || ''} ${el.getAttribute('aria-owns') || ''}`.trim().split(/\s+/);
+                if (menu.id && ids.includes(menu.id)) return true;
+                const group = el.closest('.dropdown, .btn-group');
+                return group && group.querySelector(menuSelector) === menu &&
+                    el.closest(menuSelector) !== menu;
+            });
+            if (toggles.length === 1) candidates.push({ toggle: toggles[0], menu, delete: deletes[0] });
+        }
+        // Never guess between multiple seller/delete menus on a listing page.
+        return candidates.length === 1 ? candidates[0] : null;
+    };
 
     switch (action) {
         case 'sort': return sort();
@@ -43,10 +71,10 @@ function findControl(action) {
             return visible(menu) && [...menu.querySelectorAll('a, button, [role="menuitem"]')]
                 .find(el => visible(el) && /\boldest\b/i.test(text(el)));
         }
-        case 'power': return clickable(power());
+        case 'listing-actions': return listingMenu()?.toggle || null;
         case 'trash': {
-            const menu = menuFor(power());
-            return visible(menu) && clickable([...menu.querySelectorAll('.fa-trash')].find(visible));
+            const target = listingMenu();
+            return target && visible(target.menu) && visible(target.delete) && target.delete;
         }
         case 'confirm': return buttons.find(el => el.closest('.modal, [role="dialog"]') && /^delete(?: (?:item|listing))?$/i.test(text(el)));
         case 'done': return buttons.find(el => /^done\b/i.test(text(el)));
@@ -130,7 +158,7 @@ async function waitForControl(page, action, timeoutMs = page.getDefaultTimeout()
     } catch (error) {
         if (error.name !== 'TimeoutError') throw error;
         const labels = { sort: 'Created sort dropdown', sorted: 'Created: Oldest sort result',
-            oldest: 'Oldest option in the sort menu', power: 'listing action menu',
+            oldest: 'Oldest option in the sort menu', 'listing-actions': 'unambiguous listing action menu with a Delete entry',
             trash: 'Delete action in the listing menu', confirm: 'Delete confirmation',
             done: 'Done control in the draft editor', list: 'List Item control in the preview' };
         throw new Error(`Timed out waiting for ${labels[action] || action} on ${new URL(page.url()).pathname}.`);
@@ -279,7 +307,7 @@ async function deleteOldestListing(page, log, publishedId) {
     await navigate(page, oldest);
     if (listingId(page.url()) !== oldestId) throw new Error('Unexpected listing opened; deletion stopped.');
     await dismissPopup(page);
-    await clickControl(page, 'power');
+    await clickControl(page, 'listing-actions');
     await clickControl(page, 'trash');
     await clickControl(page, 'confirm');
     await settle(page);

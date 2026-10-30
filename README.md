@@ -73,7 +73,11 @@ and submission steps so a timeout identifies which step failed.
 ## Share a failure log
 
 Click **Copy Logs** after a failure and paste the result when reporting it. The
-log includes the app version, settings, current step and elapsed time, listing
+app copies through Electron's main process and checks the clipboard before
+showing **Copied**. If copying fails, the button shows **Copy failed** and the log
+explains the error; use **Open Logs Folder** to access the saved file instead.
+
+The log includes the app version, settings, current step and elapsed time, listing
 IDs, navigation addresses, HTTP response codes, and error details. Failure reports
 also include page readiness, visible action controls, and recent browser or
 Gameflip request failures. Normal session cleanup is logged separately from an
@@ -101,7 +105,10 @@ local and are excluded from Git.
 With **Delete Oldest Listing** checked, the app verifies that the new listing was
 published, opens On Sale, selects **Created: Oldest**, and opens the oldest
 individual listing. It uses that listing's action menu and confirmation dialog,
-then refreshes On Sale to check that the listing disappeared. It never falls
+then refreshes On Sale to check that the listing disappeared. The menu is
+identified by its own **Delete** entry rather than its icon, and must have one
+identifiable toggle outside navigation, profile, and logout menus. Ambiguous or
+unavailable controls pause the run without deleting anything. It never falls
 back to deleting the first unsorted item and does not delete the newly posted
 listing when it is the only one available.
 
@@ -158,6 +165,11 @@ posting and deletion failures, single-tab actions,
 overlapping runs, stopping, and loop rate limiting. They do not use your login
 profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.
+
+Regression coverage also checks main-process clipboard writes and failures,
+menu ownership with different icons and text-only Delete entries, rejection of
+ambiguous/account menus, and a full 105-draft scan through publication and count
+maintenance.
 
 For the prepared Linux cloud checkout (which already has system Chromium):
 

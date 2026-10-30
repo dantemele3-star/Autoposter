@@ -1,4 +1,4 @@
-const { app, BrowserWindow, ipcMain, shell } = require('electron');
+const { app, BrowserWindow, ipcMain, shell, clipboard } = require('electron');
 const puppeteer = require('puppeteer');
 const path = require('path');
 const fs = require('fs');
@@ -213,6 +213,21 @@ ipcMain.handle('stop-drafts', async () => {
     console.log("🛑 Stop signal sent from GUI...");
     shouldStop = true;
     return { success: true };
+});
+
+ipcMain.handle('copy-logs', async (_event, text) => {
+    try {
+        if (typeof text !== 'string' || !text.trim()) throw new Error('There are no logs to copy.');
+        clipboard.writeText(text);
+        // Some Windows clipboard failures do not throw. Verify the write before
+        // telling the renderer that copying succeeded (Windows may use CRLF).
+        if (clipboard.readText().replace(/\r\n/g, '\n') !== text.replace(/\r\n/g, '\n')) {
+            throw new Error('The clipboard did not retain the copied logs.');
+        }
+        return { success: true };
+    } catch (error) {
+        return { success: false, error: redact(error.message) };
+    }
 });
 
 ipcMain.handle('open-logs', async () => {

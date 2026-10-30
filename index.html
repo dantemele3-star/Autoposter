@@ -273,7 +273,7 @@
     </div>
 
     <script>
-        const { ipcRenderer, clipboard } = require('electron');
+        const { ipcRenderer } = require('electron');
 
         const startBtn = document.getElementById('startBtn');
         const stopBtn = document.getElementById('stopBtn');
@@ -281,11 +281,24 @@
         const settings = [...document.querySelectorAll('.settings-grid input')];
         const pendingLogs = [];
         let logFrame = null;
-        document.getElementById('copyLogs').addEventListener('click', event => {
-            flushLogs();
-            clipboard.writeText(logContainer.textContent);
-            event.currentTarget.textContent = 'Copied';
-            setTimeout(() => document.getElementById('copyLogs').textContent = 'Copy Logs', 2000);
+        const copyLogsBtn = document.getElementById('copyLogs');
+        let copyFeedbackTimer;
+        copyLogsBtn.addEventListener('click', async () => {
+            clearTimeout(copyFeedbackTimer);
+            copyLogsBtn.disabled = true;
+            copyLogsBtn.textContent = 'Copying...';
+            try {
+                flushLogs();
+                const result = await ipcRenderer.invoke('copy-logs', logContainer.textContent);
+                if (!result?.success) throw new Error(result?.error || 'The clipboard could not be updated.');
+                copyLogsBtn.textContent = 'Copied';
+            } catch (error) {
+                copyLogsBtn.textContent = 'Copy failed';
+                appendLog(`❌ Could not copy logs: ${error.message} Use Open Logs Folder to access autoposter.log.`);
+            } finally {
+                copyLogsBtn.disabled = false;
+                copyFeedbackTimer = setTimeout(() => copyLogsBtn.textContent = 'Copy Logs', 4000);
+            }
         });
         document.getElementById('openLogs').addEventListener('click', async () => {
             try {

@@ -29,13 +29,16 @@ before(async () => {
 });
 after(async () => browser?.close());
 beforeEach(async () => {
-    state = { listings: [RECENT, OLD], visits: [], requests: [], deleted: [], published: [], timers: [], posts: 0, drafts: 1 };
+    state = { listings: [RECENT, OLD], visits: [], requests: [], deleted: [], published: [], posts: 0, drafts: 1 };
     page = await browser.newPage();
     let actionClock = 0;
     setPagePacer(page, new ActionPacer({ now: () => actionClock, sleep: async ms => { actionClock += ms; } }));
     const setPageTimeout = page.setDefaultTimeout.bind(page);
     page.setDefaultTimeout = ms => setPageTimeout(Math.min(ms, 1500));
     page.setDefaultTimeout(1500);
+    // Keep missing-control failures fast without applying that shortened test
+    // timeout to Chromium navigations on a loaded cloud worker.
+    page.setDefaultNavigationTimeout(30000);
     await page.setRequestInterception(true);
     page.on('request', async request => {
         const url = new URL(request.url());
@@ -51,7 +54,7 @@ beforeEach(async () => {
                 state.published.push(url.searchParams.get('id'));
                 const currentState = state;
                 const activate = () => currentState.listings.unshift(url.searchParams.get('id'));
-                if (state.indexDelay) state.timers.push(global.setTimeout(activate, state.indexDelay));
+                if (state.indexAfterSaleReads) state.pendingIndex = activate;
                 else activate();
                 state.afterPost?.();
             }
@@ -73,7 +76,6 @@ beforeEach(async () => {
     });
 });
 afterEach(async () => {
-    for (const timer of state.timers) clearTimeout(timer);
     await page?.close();
     for (const folder of stateFolders.splice(0)) fs.rmSync(folder, { recursive: true, force: true });
 });
@@ -130,6 +132,10 @@ function fixture(url) {
     } else if (url.pathname === '/notification-prompt') {
         content = notificationPrompt("parent.postMessage('declined', '*')");
     } else if (url.pathname === '/listings/onsale') {
+        if (state.pendingIndex && (state.saleReads = (state.saleReads || 0) + 1) >= state.indexAfterSaleReads) {
+            state.pendingIndex();
+            state.pendingIndex = null;
+        }
         const saleIds = state.salePages ? state.salePages[Number(url.searchParams.get('page') || 1) - 1] || [] : state.listings;
         content = `${state.saleListButton ? '<button>List Item</button>' : ''}<div class="dropdown" id="sort">
             <button class="dropdown-toggle" onclick="this.parentElement.classList.toggle('open')">Created: Newest</button>
@@ -146,10 +152,19 @@ function fixture(url) {
         </script>`;
         if (state.salePopup) content += notificationPrompt("fetch('/fixture/decline'); this.closest('.notification-prompt').remove()");
     } else if (id) {
-        content = `<div class="dropdown" id="actions">
-            <button onclick="this.parentElement.classList.toggle('open')"><span class="fa-power-off">Power</span></button>
-            <div class="dropdown-menu"><button onclick="document.querySelector('.modal').style.display='block'">
-                <span class="fa-trash">Delete listing</span></button></div>
+        const icon = state.actionIcon === 'svg' ? '<svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="2" /></svg>'
+            : `<i class="${state.actionIcon || 'fa-ellipsis-h'}" aria-hidden="true"></i>`;
+        const menu = `<div id="listing-actions-menu" class="dropdown-menu" role="menu">
+            <a role="menuitem" href="#" ${state.titleOnlyDelete ? 'title="Delete listing"' : ''}
+                onclick="event.preventDefault(); document.querySelector('.modal').style.display='block'">
+                ${state.textOnlyDelete ? '' : '<span class="fa-trash"></span>'}${state.titleOnlyDelete ? '' : 'Delete listing'}</a></div>`;
+        const toggle = `onclick="document.querySelector('#listing-actions-menu').style.display='block'"`;
+        const tag = state.spanToggle ? 'span' : 'button';
+        content = `${state.portalMenu ? `<button aria-controls="listing-actions-menu" aria-haspopup="menu" aria-label="Listing actions" ${toggle}>${icon}</button>${menu}`
+            : `<div class="dropdown" id="actions"><${tag} class="dropdown-toggle" aria-label="Listing actions" ${toggle}>${icon}</${tag}>${menu}</div>`}
+        <div class="dropdown" id="account-outside-header">
+            <button onclick="window.wrongMenu=true"><i class="fa-power-off"></i>Account</button>
+            <div class="dropdown-menu"><a href="/logout">Log out</a><button>Delete</button></div>
         </div><div class="modal" role="dialog" style="display:none">
             <button class="btn-primary" onclick="fetch('/fixture/delete?id=${id}').then(() => location.href='/listings/onsale')">Delete</button>
         </div>`;
@@ -176,7 +191,8 @@ function notificationPrompt(decline, custom = false) {
             <${tag} onclick="${decline}"><span>NOT</span> <span>NOW</span></${tag}></div></div>`;
 }
 
-function mainProcess({ random = Math.random, skipWaits = false, stateFolder, launchError, closeError } = {}) {
+function mainProcess({ random = Math.random, skipWaits = false, stateFolder, launchError, closeError, clipboard,
+    publicationTimeoutMs = 1500 } = {}) {
     if (!stateFolder) {
         stateFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'autoposter-state-test-'));
         stateFolders.push(stateFolder);
@@ -194,13 +210,14 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
         app: { getPath: () => stateFolder, whenReady: () => ({ then() {} }), requestSingleInstanceLock: () => true, quit() {} },
         BrowserWindow: { fromWebContents: () => win },
         ipcMain: { handle: (name, handler) => handlers.set(name, handler), on() {} },
+        clipboard,
         shell: { showItemInFolder: file => openedLogs.push(['file', file]),
             openPath: async folder => { openedLogs.push(['folder', folder]); return ''; } }
     };
     let clock = Date.now();
     class TestClock extends Date { static now() { return clock += 300000; } }
     const testingControls = { ...controls, waitForPublished: (target, context, options) =>
-        controls.waitForPublished(target, context, { ...options, timeoutMs: 1500, retryDelayMs: 50 }) };
+        controls.waitForPublished(target, context, { ...options, timeoutMs: publicationTimeoutMs, retryDelayMs: 50 }) };
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8'), {
         require: name => name === 'electron' ? electron : name === 'puppeteer'
             ? { launch: async () => { if (launchError) throw launchError; return fakeBrowser; } } : name === './listing-controls' ? testingControls
@@ -226,6 +243,71 @@ test('oldest deletion ignores navigation/profile menus and waits for sorted rows
     assert.equal((await browser.pages()).length, tabs);
     assert.match(logs.at(-1), /deletion verified/);
     assert.equal(await page.$eval('#profile', el => el.matches(':hover')), false);
+});
+
+for (const actionIcon of ['fa-power-off', 'fa-ellipsis-v', 'fa-cog', 'svg']) {
+    test(`oldest deletion uses the seller menu with ${actionIcon} controls rather than the account power icon`, async () => {
+        state.actionIcon = actionIcon;
+        state.textOnlyDelete = true;
+        state.listings.unshift(NEW);
+        await controls.deleteOldestListing(page, () => {}, NEW);
+        assert.deepEqual(state.deleted, [OLD]);
+        assert.deepEqual(state.listings, [NEW, RECENT]);
+        assert.equal(state.visits.includes('/logout'), false);
+    });
+}
+
+test('oldest deletion follows an explicitly associated menu outside the dropdown container', async () => {
+    state.portalMenu = true;
+    state.actionIcon = 'svg';
+    state.textOnlyDelete = true;
+    state.listings.unshift(NEW);
+    await controls.deleteOldestListing(page, () => {}, NEW);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.equal(state.visits.includes('/logout'), false);
+});
+
+test('oldest deletion accepts a non-button dropdown toggle and an icon-only Delete entry with a title', async () => {
+    state.spanToggle = true;
+    state.titleOnlyDelete = true;
+    state.actionIcon = 'svg';
+    state.listings.unshift(NEW);
+    await controls.deleteOldestListing(page, () => {}, NEW);
+    assert.deepEqual(state.deleted, [OLD]);
+});
+
+test('missing, disabled, hidden and ambiguous seller controls cannot select a profile or other Delete menu', async () => {
+    await controls.navigate(page, itemUrl(OLD));
+    await page.evaluate(() => {
+        window.originalActions = document.querySelector('#actions').outerHTML;
+        document.querySelector('#actions').remove();
+        document.querySelector('#account-outside-header .dropdown-menu').style.display = 'block';
+    });
+    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
+    assert.equal(await page.evaluate(controls.findControl, 'trash'), null);
+    await page.evaluate(() => {
+        document.querySelector('.listings-container').insertAdjacentHTML('afterbegin', window.originalActions);
+        document.querySelector('#actions > button').disabled = true;
+    });
+    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
+    await page.evaluate(() => {
+        document.querySelector('#actions > button').disabled = false;
+        document.querySelector('#actions > button').style.display = 'none';
+    });
+    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
+    await page.evaluate(() => {
+        document.querySelector('#actions > button').style.display = '';
+        document.querySelector('#actions [role="menuitem"]').setAttribute('aria-disabled', 'true');
+    });
+    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
+    await page.evaluate(() => {
+        document.querySelector('#actions [role="menuitem"]').removeAttribute('aria-disabled');
+        document.querySelector('.listings-container').insertAdjacentHTML('beforeend',
+            '<div class="dropdown"><button>Other actions</button><div class="dropdown-menu"><button>Delete</button></div></div>');
+    });
+    await assert.rejects(controls.clickControl(page, 'listing-actions'), /unambiguous listing action menu/);
+    assert.deepEqual(state.deleted, []);
+    assert.equal(await page.evaluate(() => !!window.wrongMenu), false);
 });
 
 const sourceId = n => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
@@ -467,6 +549,42 @@ test('finishes all 53 drafts before randomizing and opening a draft from page tw
     assert.ok(pageTwo >= 0 && pageTwo < firstCopy);
 });
 
+test('scans 105 drafts before posting a selected ID, verifying publication and deleting only the oldest listing', async () => {
+    const first = 0x60000000;
+    state.draftPages = [sourceIds(first, 50), sourceIds(first + 50, 50), sourceIds(first + 100, 5)];
+    state.pager = 'none';
+    state.actionIcon = 'svg';
+    state.textOnlyDelete = true;
+    let randomCalls = 0;
+    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999 });
+    let outcome;
+    const run = main.handlers.get('process-drafts')({ sender: {} }, { randomize: true, maintainLimit: true })
+        .then(result => { outcome = result; return result; });
+    try {
+        const deadline = Date.now() + 20000;
+        while (!main.logs.some(message => message.includes('Rate Limit Protection'))) {
+            assert.equal(outcome, undefined, outcome?.error || 'Run ended before count maintenance');
+            assert.ok(Date.now() < deadline, 'Did not finish count maintenance');
+            await new Promise(resolve => setTimeout(resolve, 20));
+        }
+    } finally {
+        await main.handlers.get('stop-drafts')();
+        await run;
+    }
+    assert.equal(outcome.success, true, outcome.error);
+    assert.equal(outcome.postedCount, 1);
+    assert.deepEqual(state.published, [sourceId(first + 104)]);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.deepEqual(state.listings, [sourceId(first + 104), RECENT]);
+    const scan = main.logs.findIndex(message => message.includes('Scan complete: 105 unique drafts'));
+    assert.ok(scan >= 0 && scan < main.logs.findIndex(message => message.includes('Processing Item 1/105')));
+    assert.ok(main.logs.findIndex(message => message.includes('Publication confirmed')) <
+        main.logs.findIndex(message => message.includes('Oldest listing deletion verified')));
+    const history = JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json')));
+    assert.equal(history.submissions.length, 1);
+    assert.ok(history.cooldownUntil > Date.now());
+});
+
 test('clicks the real copy button inside its wrapper and accepts an anchor Done control', async () => {
     state.copyWrapper = true;
     state.anchorDone = true;
@@ -605,12 +723,16 @@ test('finds the submitted listing on a later On Sale page without resubmitting',
 
 test('rechecks delayed On Sale indexing without posting the listing twice', async () => {
     state.publishToOnSale = true;
-    state.indexDelay = 1100;
-    const main = mainProcess();
+    // Keep the first two reads stale, then expose the listing on a retry.
+    // A wall-clock timer could fire before the first read on a busy machine.
+    state.indexAfterSaleReads = 3;
+    const main = mainProcess({ publicationTimeoutMs: 5000 });
     const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
     assert.equal(result.success, true, result.error);
     assert.equal(result.postedCount, 1);
     assert.equal(state.posts, 1);
+    assert.equal(state.saleReads, 3);
+    assert.deepEqual(state.deleted, []);
 });
 
 test('a submitted listing left on the preview is verified read-only after the UI wait', async () => {
@@ -781,11 +903,15 @@ test('overlapping runs are rejected and Stop interrupts the rate-limit wait', as
 
 test('a one-draft continuous loop still waits for the posting rate limit', async () => {
     const main = mainProcess();
-    const run = main.handlers.get('process-drafts')({ sender: {} }, { loop: true });
+    let outcome;
+    const run = main.handlers.get('process-drafts')({ sender: {} }, { loop: true })
+        .then(result => { outcome = result; return result; });
     try {
-        await page.waitForFunction(() => location.pathname.startsWith('/item/'), { timeout: 10000 });
-        const deadline = Date.now() + 5000;
+        // Publication verification immediately leaves /item/ for On Sale.
+        // Observe the actual cooldown rather than that transient address.
+        const deadline = Date.now() + 15000;
         while (!main.logs.some(message => message.includes('Rate Limit Protection'))) {
+            assert.equal(outcome, undefined, outcome?.error || 'Run ended before its cooldown');
             assert.ok(Date.now() < deadline, 'Expected rate-limit wait before restarting the loop');
             await new Promise(resolve => setTimeout(resolve, 20));
         }
@@ -793,18 +919,21 @@ test('a one-draft continuous loop still waits for the posting rate limit', async
         await main.handlers.get('stop-drafts')();
     }
     const result = await run;
+    assert.equal(result.success, true, result.error);
     assert.equal(result.postedCount, 1);
     assert.equal(state.posts, 1);
+    assert.ok(main.logs.some(message => message.includes('220-second minimum posting interval')));
 });
 
 test('the GUI captures the checkbox and locks settings until posting finishes', async () => {
     await page.evaluate(() => {
         window.calls = [];
-        window.require = () => ({ clipboard: { writeText: text => { window.copiedLogs = text; } }, ipcRenderer: {
+        window.require = () => ({ ipcRenderer: {
             on: (_, callback) => { window.receiveLog = callback; }, send() {},
             invoke: async (channel, config) => {
                 window.calls.push({ channel, config });
                 if (channel === 'process-drafts') return new Promise(resolve => window.finishRun = resolve);
+                if (channel === 'copy-logs') window.copiedLogs = config;
                 return { success: true };
             }
         }});
@@ -821,6 +950,7 @@ test('the GUI captures the checkbox and locks settings until posting finishes', 
     assert.match(await page.$eval('#logContainer', el => el.textContent), /paused after 1 confirmed posts: Deletion not confirmed/);
     assert.equal(await page.$eval('#maintainLimit', el => el.checked), true);
     await page.click('#copyLogs');
+    await page.waitForFunction(() => document.querySelector('#copyLogs').textContent === 'Copied');
     assert.match(await page.evaluate(() => window.copiedLogs), /paused after 1 confirmed posts: Deletion not confirmed/);
     await page.click('#openLogs');
     assert.equal(await page.evaluate(() => window.calls.at(-1).channel), 'open-logs');
@@ -829,5 +959,64 @@ test('the GUI captures the checkbox and locks settings until posting finishes', 
     });
     await page.waitForFunction(() => document.querySelector('#logContainer').childNodes.length === 2000);
     await page.click('#copyLogs');
+    await page.waitForFunction(() => document.querySelector('#copyLogs').textContent === 'Copied');
     assert.match(await page.evaluate(() => window.copiedLogs), /Message 2099/);
+});
+
+test('Copy Logs writes and verifies Unicode logs through the main-process clipboard', async () => {
+    let copied;
+    const main = mainProcess({ clipboard: {
+        writeText: text => { copied = text.replace(/\n/g, '\r\n'); }, readText: () => copied
+    } });
+    const result = await main.handlers.get('copy-logs')({}, '✅ Publication confirmed.\n🧹 Oldest listing deletion verified.');
+    assert.equal(result.success, true);
+    assert.equal(copied, '✅ Publication confirmed.\r\n🧹 Oldest listing deletion verified.');
+});
+
+test('Copy Logs reports Windows clipboard errors, silent failures and invalid input', async () => {
+    const broken = mainProcess({ clipboard: { writeText() { throw new Error('Clipboard is busy'); } } });
+    const failed = await broken.handlers.get('copy-logs')({}, 'Run diagnostics');
+    assert.equal(failed.success, false);
+    assert.match(failed.error, /Clipboard is busy/);
+    const unchanged = mainProcess({ clipboard: { writeText() {}, readText: () => 'old clipboard' } });
+    const silentFailure = await unchanged.handlers.get('copy-logs')({}, 'New diagnostics');
+    assert.equal(silentFailure.success, false);
+    assert.match(silentFailure.error, /did not retain/);
+    for (const value of ['', '  ', null, {}]) {
+        const invalid = await unchanged.handlers.get('copy-logs')({}, value);
+        assert.equal(invalid.success, false);
+        assert.match(invalid.error, /no logs to copy/);
+    }
+});
+
+test('Copy Logs flushes pending messages, prevents duplicate requests and exposes failures in the GUI', async () => {
+    await page.evaluate(() => {
+        window.copies = [];
+        window.require = () => ({ ipcRenderer: {
+            on: (_, callback) => { window.receiveLog = callback; }, send() {},
+            invoke: (_channel, text) => new Promise((resolve, reject) => {
+                window.copies.push(text); window.copyResult = resolve; window.copyError = reject;
+            })
+        }});
+    });
+    await page.setContent(fs.readFileSync(path.join(__dirname, '../index.html'), 'utf8'));
+    await page.evaluate(() => {
+        window.receiveLog(null, 'Unflushed failure details');
+        document.querySelector('#copyLogs').click();
+        document.querySelector('#copyLogs').click();
+    });
+    assert.equal(await page.$eval('#copyLogs', el => el.disabled), true);
+    assert.equal(await page.evaluate(() => window.copies.length), 1);
+    assert.match(await page.evaluate(() => window.copies[0]), /Unflushed failure details/);
+    await page.evaluate(() => window.copyResult({ success: false, error: 'Clipboard is busy' }));
+    await page.waitForFunction(() => document.querySelector('#copyLogs').textContent === 'Copy failed');
+    assert.match(await page.$eval('#logContainer', el => el.textContent), /Could not copy logs: Clipboard is busy.*Open Logs Folder/);
+    assert.equal(await page.$eval('#copyLogs', el => el.disabled), false);
+    await page.click('#copyLogs');
+    await page.evaluate(() => window.copyError(new Error('IPC disconnected')));
+    await page.waitForFunction(() => document.querySelector('#logContainer').textContent.includes('IPC disconnected'));
+    assert.equal(await page.$eval('#copyLogs', el => el.textContent), 'Copy failed');
+    await page.click('#copyLogs');
+    await page.evaluate(() => window.copyResult({ success: true }));
+    await page.waitForFunction(() => document.querySelector('#copyLogs').textContent === 'Copied');
 });
