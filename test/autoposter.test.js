@@ -93,7 +93,7 @@ beforeEach(async () => {
     });
 });
 afterEach(async () => {
-    await page?.close();
+    if (page && !page.isClosed()) await page.close();
     for (const folder of stateFolders.splice(0)) fs.rmSync(folder, { recursive: true, force: true });
 });
 
@@ -127,6 +127,7 @@ function fixture(url) {
         }
         if (state.popup) content += '<div class="modal" role="dialog"><button onclick="this.parentElement.style.display=\'none\'">Not now</button></div>';
         if (state.backgroundDraftTraffic) content += backgroundPolling;
+        if (state.reopenFrameRace) content += '<iframe title="Background widget" src="https://widgets.example.test/background-widget"></iframe>';
         if (state.draftRowDelay || state.draftsNeverReady || state.blankDraftPage) content += `<script>
             const region = document.querySelector('.listings-container');
             const copies = [...region.querySelectorAll('.tool-duplicate')];
@@ -599,7 +600,19 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     state.textOnlyDelete = true;
     state.backgroundDraftTraffic = true;
     let randomCalls = 0;
-    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999 });
+    let frameRaces = 0;
+    page.on('frameattached', frame => {
+        if (!state.reopenFrameRace) return;
+        const original = frame.frameElement.bind(frame);
+        let first = true;
+        frame.frameElement = async () => {
+            if (first) { first = false; frameRaces++; throw frameOwnerError(); }
+            return original();
+        };
+    });
+    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999, onLog: message => {
+        if (message.includes('Scan complete: 105 unique drafts')) state.reopenFrameRace = true;
+    } });
     let outcome;
     const run = main.handlers.get('process-drafts')({ sender: {} }, { randomize: true, maintainLimit: true })
         .then(result => { outcome = result; return result; });
@@ -617,6 +630,7 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     assert.equal(outcome.success, true, outcome.error);
     assert.equal(outcome.postedCount, 1);
     assert.deepEqual(state.published, [sourceId(first + 104)]);
+    assert.ok(frameRaces > 0, 'The cached-page iframe-owner race must actually execute');
     assert.deepEqual(state.deleted, [OLD]);
     assert.deepEqual(state.listings, [sourceId(first + 104), RECENT]);
     const scan = main.logs.findIndex(message => message.includes('Scan complete: 105 unique drafts'));
@@ -626,6 +640,73 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     const history = JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json')));
     assert.equal(history.submissions.length, 1);
     assert.ok(history.cooldownUntil > Date.now());
+});
+
+function frameOwnerError() {
+    return Object.assign(new Error('Protocol error (DOM.getFrameOwner): Frame with the given id was not found.'), { name: 'ProtocolError' });
+}
+
+for (const detached of [false, true]) {
+    test(`popup checks tolerate an iframe-owner race (detach event delivered=${detached}) and still dismiss a live prompt`, async () => {
+        await page.setContent('<iframe id="stale"></iframe><iframe id="live"></iframe>');
+        const frames = page.frames().filter(frame => frame !== page.mainFrame());
+        const [stale, live] = frames;
+        await live.setContent(notificationPrompt("window.declines = (window.declines || 0) + 1; this.closest('.notification-prompt').remove()"));
+        const original = stale.frameElement.bind(stale);
+        let races = 0;
+        stale.frameElement = async () => {
+            if (!races) {
+                races++;
+                if (detached) await page.$eval('#stale', el => el.remove());
+                throw frameOwnerError();
+            }
+            return original();
+        };
+        assert.equal(await controls.dismissPopup(page), true);
+        assert.equal(races, 1);
+        assert.equal(await live.evaluate(() => window.declines), 1);
+        assert.equal(state.accepts || 0, 0);
+        assert.equal(await live.$('.notification-prompt'), null);
+    });
+}
+
+for (const target of ['main', 'child']) {
+    test(`popup checks still propagate unexpected ${target}-frame protocol failures`, async () => {
+        await page.setContent('<iframe></iframe>');
+        if (target === 'main') {
+            page.mainFrame().evaluateHandle = async () => { throw new Error('Protocol error (Runtime.evaluate): Internal error'); };
+        } else {
+            const child = page.frames().find(frame => frame !== page.mainFrame());
+            child.frameElement = async () => { throw new Error('Protocol error (DOM.getFrameOwner): Internal error'); };
+        }
+        await assert.rejects(controls.dismissPopup(page), /Internal error/);
+        assert.equal(state.posts, 0);
+    });
+}
+
+test('popup checks do not hide a closed browser page', async () => {
+    await page.close();
+    await assert.rejects(controls.dismissPopup(page), /closed|detached/i);
+});
+
+test('draft readiness retries an execution-context replacement before choosing the source ID', async () => {
+    page.setDefaultTimeout(5000);
+    const queue = await drafts.scanDrafts(page, () => {});
+    const evaluate = page.evaluate.bind(page);
+    let replacements = 0;
+    page.evaluate = async (fn, ...args) => {
+        if (fn.name === 'draftReadiness' && !replacements) {
+            replacements++;
+            throw new Error('Execution context was destroyed, most likely because of a navigation.');
+        }
+        return evaluate(fn, ...args);
+    };
+    assert.equal(await drafts.openDraft(page, queue[0], () => {}), true);
+    const done = await controls.waitForControl(page, 'done');
+    await done.dispose();
+    assert.equal(replacements, 1);
+    assert.equal(new URL(page.url()).pathname, `/listings/${NEW}/edit`);
+    assert.equal(state.posts, 0);
 });
 
 test('initial Drafts navigation and scanning succeed with persistent background traffic', async () => {

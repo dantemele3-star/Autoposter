@@ -134,6 +134,12 @@ Every dismissal is logged and checked before continuing. A prompt that stays
 visible pauses the run with a specific error. Publication is still verified by
 listing ID; dismissing a prompt does not submit the listing again.
 
+Popup checks tolerate background iframes removed during navigation, including
+Chrome reporting that a frame's DOM owner no longer exists. Remaining live frames
+are still checked for notification prompts. Draft readiness retries temporary
+page-context replacements within its existing timeout and revalidates the source
+ID before copying; closed pages and other protocol failures still stop the run.
+
 Navigation and clicks are separated by at least two seconds after the previous
 action completes. Controls must also be ready before they are clicked. After
 List Item, the app allows a 90-second confirmation window and checks On Sale by

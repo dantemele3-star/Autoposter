@@ -1,4 +1,4 @@
-const { clickElement, navigate, dismissPopup, usablePageResponse, pendingListingRequests } = require('./listing-controls');
+const { clickElement, navigate, dismissPopup, usablePageResponse, pendingListingRequests, changingContext } = require('./listing-controls');
 const { paceAction } = require('./pacing');
 
 const PAGE_SIZE = 50;
@@ -86,20 +86,30 @@ async function waitForDraftPage(page, ordinal, log) {
     let stableSince = 0, previous, lastError, signals, pending = [];
     log(`Waiting for draft page ${ordinal} to finish rendering and its rows to stay stable...`);
     do {
-        await dismissPopup(page);
-        signals = await page.evaluate(draftReadiness);
-        if (signals.error) throw new Error(`Draft page ${ordinal}: ${signals.error}`);
-        pending = await pendingListingRequests(page);
-        let current;
-        try { current = await snapshot(page); lastError = null; }
-        catch (error) { lastError = error; }
-        if (current && !signals.loading && !signals.busy && !pending.length &&
-            signals.visibleCopies === current.rows.length && (current.rows.length || signals.empty)) {
-            const boundary = await page.evaluate(pageBoundary, ordinal);
-            const signature = JSON.stringify([current.signature, boundary]);
-            if (signature !== previous) { previous = signature; stableSince = Date.now(); }
-            else if (Date.now() - stableSince >= DRAFT_STABLE_MS) return current;
-        } else { previous = undefined; stableSince = 0; }
+        try {
+            await dismissPopup(page);
+            signals = await page.evaluate(draftReadiness);
+            if (signals.error) throw new Error(`Draft page ${ordinal}: ${signals.error}`);
+            pending = await pendingListingRequests(page);
+            let current;
+            try { current = await snapshot(page); lastError = null; }
+            catch (error) { lastError = error; }
+            if (current && !signals.loading && !signals.busy && !pending.length &&
+                signals.visibleCopies === current.rows.length && (current.rows.length || signals.empty)) {
+                const boundary = await page.evaluate(pageBoundary, ordinal);
+                const signature = JSON.stringify([current.signature, boundary]);
+                if (signature !== previous) { previous = signature; stableSince = Date.now(); }
+                else if (Date.now() - stableSince >= DRAFT_STABLE_MS) return current;
+            } else { previous = undefined; stableSince = 0; }
+        } catch (error) {
+            if (page.isClosed() || !changingContext(error)) throw error;
+            // Cached documents can replace their execution context while the
+            // child-frame detach events are still arriving. Retry only reads;
+            // require a fresh stable ID snapshot before any copy is clicked.
+            previous = undefined;
+            stableSince = 0;
+            lastError = error;
+        }
         await new Promise(resolve => setTimeout(resolve, 100));
     } while (Date.now() < deadline);
     if (lastError) throw lastError;

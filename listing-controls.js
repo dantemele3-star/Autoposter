@@ -232,9 +232,12 @@ async function clickControl(page, action, options) {
 }
 
 async function popupControl(page) {
+    if (page.isClosed()) throw new Error('Browser page closed while checking notification popups.');
     for (const frame of page.frames()) {
+        const childFrame = frame !== page.mainFrame();
+        if (childFrame && (frame.detached || !page.frames().includes(frame))) continue;
         try {
-            if (frame !== page.mainFrame()) {
+            if (childFrame) {
                 const element = await frame.frameElement();
                 let visible;
                 try { visible = element && await element.evaluate(el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden'); }
@@ -245,10 +248,22 @@ async function popupControl(page) {
             if (handle.asElement()) return { frame, handle };
             await handle.dispose();
         } catch (error) {
+            if (page.isClosed()) throw error;
+            // The frame list and Chrome's DOM-owner lookup are not atomic.
+            // Ad/notification iframes can disappear before Puppeteer reports
+            // their detach event. Only this missing-child-owner error is benign.
+            if (childFrame && (frame.detached || !page.frames().includes(frame) || missingFrameOwner(error))) continue;
             if (!changingContext(error)) throw error;
         }
     }
     return null;
+}
+
+function missingFrameOwner(error) {
+    for (let current = error, depth = 0; current && depth < 4; current = current.cause, depth++) {
+        if (/DOM\.getFrameOwner.*(?:Frame with the given id was not found|No frame for given id)/i.test(current.message || '')) return true;
+    }
+    return false;
 }
 
 async function settle(page) {
@@ -472,5 +487,5 @@ async function waitForPublished(page, context, {
 
 module.exports = {
     listingId, findControl, clickElement, clickControl, waitForControl, navigate, dismissPopup,
-    deleteOldestListing, capturePublication, waitForPublished, settle, usablePageResponse, pendingListingRequests
+    deleteOldestListing, capturePublication, waitForPublished, settle, usablePageResponse, pendingListingRequests, changingContext
 };
