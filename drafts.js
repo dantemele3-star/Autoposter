@@ -1,8 +1,29 @@
-const { clickElement, navigate, dismissPopup, usablePageResponse } = require('./listing-controls');
+const { clickElement, navigate, dismissPopup, usablePageResponse, pendingListingRequests } = require('./listing-controls');
 const { paceAction } = require('./pacing');
 
 const PAGE_SIZE = 50;
 const draftUrl = page => `https://gameflip.com/listings/draft?page=${page}&limit=${PAGE_SIZE}`;
+const DRAFT_STABLE_MS = 1000;
+
+// Runs in Chrome. Loading a list and loading unrelated page resources are
+// different conditions; only visible list state determines draft readiness.
+function draftReadiness() {
+    // Decorative copy/spinner icons may be aria-hidden while still visible.
+    const visible = el => el.getClientRects().length && getComputedStyle(el).visibility !== 'hidden' &&
+        !el.closest('header, nav, .navbar, .dropdown-menu');
+    const root = document.querySelector('.listings-container, main') || document.body;
+    const busySelector = '[aria-busy="true"], [role="progressbar"], .loading, .spinner, .loading-spinner';
+    const busy = [root, ...root.querySelectorAll(busySelector)].some(el => el.matches(busySelector) && visible(el));
+    const empty = [...root.querySelectorAll('p, h1, h2, h3, [role="status"], .empty-state')].some(el => visible(el) &&
+        /^(?:no (?:saved )?(?:drafts|listings|items)(?: (?:found|available|yet|to display|to show))?|you (?:have no|don't have any|do not have any|haven't created any|have not created any) (?:drafts|listings|items))[.!]?$/i
+            .test((el.innerText || '').trim()));
+    const error = [...root.querySelectorAll('.alert-danger, .alert-error, [role="alert"]')].find(el => visible(el) &&
+        /(?:unable|failed|could not) to load|error loading/i.test(el.innerText || ''));
+    return { loading: document.readyState === 'loading', busy, empty,
+        visibleCopies: [...document.querySelectorAll('.tool-duplicate')].filter(el =>
+            visible(el.closest('a, button, [role="button"]') || el.querySelector('a, button, [role="button"]') || el)).length,
+        error: error ? 'Gameflip reported that its listing data could not be loaded.' : null };
+}
 
 // Runs inside Chrome. Identify the source draft, not its changing row position.
 function draftRows(button = null) {
@@ -59,7 +80,38 @@ async function snapshot(page) {
     return { rows, signature: JSON.stringify(rows.map(row => row.key)) };
 }
 
-async function loadPage(page, ordinal, log, navigationOptions) {
+async function waitForDraftPage(page, ordinal, log) {
+    const timeout = page.getDefaultTimeout();
+    const deadline = timeout ? Date.now() + timeout : Infinity;
+    let stableSince = 0, previous, lastError, signals, pending = [];
+    log(`Waiting for draft page ${ordinal} to finish rendering and its rows to stay stable...`);
+    do {
+        await dismissPopup(page);
+        signals = await page.evaluate(draftReadiness);
+        if (signals.error) throw new Error(`Draft page ${ordinal}: ${signals.error}`);
+        pending = await pendingListingRequests(page);
+        let current;
+        try { current = await snapshot(page); lastError = null; }
+        catch (error) { lastError = error; }
+        if (current && !signals.loading && !signals.busy && !pending.length &&
+            signals.visibleCopies === current.rows.length && (current.rows.length || signals.empty)) {
+            const boundary = await page.evaluate(pageBoundary, ordinal);
+            const signature = JSON.stringify([current.signature, boundary]);
+            if (signature !== previous) { previous = signature; stableSince = Date.now(); }
+            else if (Date.now() - stableSince >= DRAFT_STABLE_MS) return current;
+        } else { previous = undefined; stableSince = 0; }
+        await new Promise(resolve => setTimeout(resolve, 100));
+    } while (Date.now() < deadline);
+    if (lastError) throw lastError;
+    throw new Error(`Draft page ${ordinal} did not become ready before the loading timeout: ` +
+        `${signals?.visibleCopies || 0} visible drafts; loading=${Boolean(signals?.loading || signals?.busy)}; ` +
+        `listing-data requests=${pending.length}${pending.length ? ` (${pending.join(', ')})` : ''}. No partial page was accepted.`);
+}
+
+async function loadPage(page, ordinal, log) {
+    // Draft readiness is established below; fonts, images, polling and other
+    // background requests do not have to become globally idle.
+    const navigationOptions = { waitForIdle: false };
     let response = await navigate(page, draftUrl(ordinal), navigationOptions);
     // A 304 with no usable cached body must not turn a full queue into a
     // seemingly complete partial scan. Confirm an empty page without cache.
@@ -77,7 +129,7 @@ async function loadPage(page, ordinal, log, navigationOptions) {
     if (new URL(page.url()).pathname.replace(/\/$/, '') !== '/listings/draft') {
         throw new Error('Gameflip left the Drafts section during scanning; posting paused.');
     }
-    return snapshot(page);
+    return waitForDraftPage(page, ordinal, log);
 }
 
 async function walkPages(page, visit, log, stopped) {
@@ -125,7 +177,7 @@ async function openDraft(page, draft, log, stopped = () => false) {
     // is enough here: loadPage validates the response/section/identities, and we
     // recheck the selected ID below and immediately before the actual click.
     log(`Reopening draft page ${draft.page}; checking the selected source ID in the rendered controls...`);
-    let current = (await loadPage(page, draft.page, log, { waitForIdle: false })).rows.find(row => row.key === draft.key);
+    let current = (await loadPage(page, draft.page, log)).rows.find(row => row.key === draft.key);
     if (!current) {
         log(`Draft moved from scanned page ${draft.page}; locating it by listing ID...`);
         current = await walkPages(page, rows => rows.find(row => row.key === draft.key), log, stopped);

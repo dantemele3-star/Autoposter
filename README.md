@@ -70,10 +70,14 @@ original draft again instead of clicking its old row number. Newly appearing
 drafts are picked up in the next cycle. The log names the copy, Done, preview,
 and submission steps so a timeout identifies which step failed.
 
-Reopening a scanned draft checks its rendered source ID without requiring all
-background traffic to stop. Other page-settling waits track Chrome's current
-document, so requests from an earlier page cannot hold up the next step. Current
-page requests still have to settle before using the oldest-sorted listings.
+Initial Drafts navigation, scanning, and reopening use rendered list readiness
+instead of waiting for every background request to stop. Each scanned page must
+have stable identifiable rows (or an explicit empty-state message), no visible
+list-loading indicator, and no unfinished listing-data request. Rows and
+pagination must stay stable for a full second. An unfinished page pauses the run
+instead of ending the scan early. The preview is checked for its List Item control
+before submission. Current page requests still have to settle before using the
+oldest-sorted listings.
 
 ## Share a failure log
 
@@ -174,7 +178,9 @@ and the Windows desktop interaction still need checking on your PC.
 Regression coverage also checks asynchronous main-process clipboard writes and failures,
 menu ownership with different icons and text-only Delete entries, rejection of
 ambiguous/account menus, and a full 105-draft scan through publication and count
-maintenance, including background polling after scanning.
+maintenance, including background polling from the first Drafts navigation,
+delayed row batches, unfinished loading indicators, and delayed listing-data
+responses.
 
 For the prepared Linux cloud checkout (which already has system Chromium):
 

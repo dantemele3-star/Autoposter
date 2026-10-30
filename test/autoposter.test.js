@@ -34,7 +34,7 @@ beforeEach(async () => {
     let actionClock = 0;
     setPagePacer(page, new ActionPacer({ now: () => actionClock, sleep: async ms => { actionClock += ms; } }));
     const setPageTimeout = page.setDefaultTimeout.bind(page);
-    page.setDefaultTimeout = ms => setPageTimeout(Math.min(ms, 1500));
+    page.setDefaultTimeout = ms => setPageTimeout(Math.min(ms, 5000));
     page.setDefaultTimeout(1500);
     // Keep missing-control failures fast without applying that shortened test
     // timeout to Chromium navigations on a loaded cloud worker.
@@ -45,7 +45,15 @@ beforeEach(async () => {
         state.visits.push(url.pathname);
         state.requests.push(url.href);
         let body;
-        if (url.pathname === '/fixture/background') {
+        if (url.pathname === '/api/listings') {
+            if (state.draftDataNeverReady) return;
+            await new Promise(resolve => global.setTimeout(resolve, state.draftDataDelay));
+            try { await request.respond({ status: 200, contentType: 'application/json', body: '{}' }); }
+            catch (error) {
+                if (!/closed|No resource|Invalid InterceptionId/i.test(error.message)) throw error;
+            }
+            return;
+        } else if (url.pathname === '/fixture/background') {
             // Polling keeps the draft document busy. Individual responses still
             // complete, so leaving that document can drain the outstanding work.
             await new Promise(resolve => global.setTimeout(resolve, 150));
@@ -99,12 +107,13 @@ function fixture(url) {
         const pages = state.draftPages || [[NEW, NEXT].slice(0, state.drafts)];
         const number = state.ignorePage ? 1 : Number(url.searchParams.get('page') || 1);
         const ids = pages[number - 1] || [];
-        content = ids.map(id => state.copyWrapper
+        if (!ids.length && !state.blankDraftPage) content += '<p class="empty-state">No drafts found.</p>';
+        content += ids.map(id => state.copyWrapper
             ? `<div data-listing-id="${id}"><a href="/item/source/${id}">Source draft</a>
                 <span class="tool-duplicate"><button onpointerdown="window.pressed=true"
                     onclick="if(window.pressed) location.href='/listings/${id}/edit'">Copy</button></span></div>`
-            : `<a class="tool-duplicate" target="_blank" href="${state.sharedCopyLink ? '/listings/copy' : state.queryEditor ? `/listing/edit?id=${id}` : `/listings/${id}/edit` }"
-                ${state.blockCopy ? 'onclick="event.preventDefault()"' : ''}>Create a copy in Draft</a>`).join('');
+            : `<a class="${state.decorativeCopyIcons ? '' : 'tool-duplicate'}" target="_blank" href="${state.sharedCopyLink ? '/listings/copy' : state.queryEditor ? `/listing/edit?id=${id}` : `/listings/${id}/edit` }"
+                ${state.blockCopy ? 'onclick="event.preventDefault()"' : ''}>${state.decorativeCopyIcons ? '<span class="tool-duplicate" aria-hidden="true">Copy</span>' : 'Create a copy in Draft'}</a>`).join('');
         if (state.pager === 'none') {
             content += '<section><button disabled>Next</button></section>';
         } else if (state.pager === 'buttons') {
@@ -118,6 +127,27 @@ function fixture(url) {
         }
         if (state.popup) content += '<div class="modal" role="dialog"><button onclick="this.parentElement.style.display=\'none\'">Not now</button></div>';
         if (state.backgroundDraftTraffic) content += backgroundPolling;
+        if (state.draftRowDelay || state.draftsNeverReady || state.blankDraftPage) content += `<script>
+            const region = document.querySelector('.listings-container');
+            const copies = [...region.querySelectorAll('.tool-duplicate')];
+            const savedRows = copies.map(el => el.outerHTML);
+            copies.forEach(el => el.remove());
+            ${state.blankDraftPage ? '' : state.draftLoadingIcon
+                ? `region.insertAdjacentHTML('beforeend', '<span class="spinner" aria-hidden="true">Loading drafts...</span>');`
+                : `region.setAttribute('aria-busy', 'true');`}
+            ${state.draftRowDelay ? `setTimeout(() => region.insertAdjacentHTML('beforeend', savedRows.slice(0, 1).join('')), 100);
+                setTimeout(() => { region.insertAdjacentHTML('beforeend', savedRows.slice(1).join(''));
+                    region.setAttribute('aria-busy', 'false'); region.querySelector('.spinner')?.remove(); }, ${state.draftRowDelay});` : ''}
+        </script>`;
+        if (state.draftDataDelay || state.draftDataNeverReady) content += `<script>
+            const region = document.querySelector('.listings-container');
+            const remaining = [...region.querySelectorAll('.tool-duplicate')].slice(1);
+            const savedRows = remaining.map(el => el.outerHTML);
+            remaining.forEach(el => el.remove());
+            fetch('/api/listings?page=${number}').then(response => response.json()).then(() => {
+                region.insertAdjacentHTML('beforeend', savedRows.join(''));
+            });
+        </script>`;
     } else if (url.pathname.endsWith('/edit')) {
         const preview = state.queryEditor ? `/listing/preview?id=${id}` : `/listings/${id}/preview`;
         content = state.anchorDone
@@ -567,10 +597,9 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     state.pager = 'none';
     state.actionIcon = 'svg';
     state.textOnlyDelete = true;
+    state.backgroundDraftTraffic = true;
     let randomCalls = 0;
-    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999, onLog: message => {
-        if (message.includes('Scan complete: 105 unique drafts')) state.backgroundDraftTraffic = true;
-    } });
+    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999 });
     let outcome;
     const run = main.handlers.get('process-drafts')({ sender: {} }, { randomize: true, maintainLimit: true })
         .then(result => { outcome = result; return result; });
@@ -597,6 +626,76 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     const history = JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json')));
     assert.equal(history.submissions.length, 1);
     assert.ok(history.cooldownUntil > Date.now());
+});
+
+test('initial Drafts navigation and scanning succeed with persistent background traffic', async () => {
+    state.backgroundDraftTraffic = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, JSON.stringify({ result, logs: main.logs }));
+    assert.equal(result.postedCount, 1);
+    assert.deepEqual(state.published, [NEW]);
+});
+
+test('draft readiness uses the clickable parent of a decorative aria-hidden copy icon', async () => {
+    state.decorativeCopyIcons = true;
+    state.backgroundDraftTraffic = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, JSON.stringify({ result, logs: main.logs }));
+    assert.deepEqual(state.published, [NEW]);
+});
+
+test('draft scanning waits for delayed batches and loading indicators before ending a short page', async () => {
+    page.setDefaultTimeout(5000);
+    state.draftPages = [sourceIds(100, 50), sourceIds(150, 5)];
+    state.draftRowDelay = 1800;
+    state.backgroundDraftTraffic = true;
+    const queue = await drafts.scanDrafts(page, () => {});
+    assert.equal(queue.length, 55);
+    assert.equal(queue.at(-1).key, sourceId(154));
+    assert.equal(state.posts, 0);
+});
+
+test('a visible decorative loading spinner prevents accepting the first partial draft batch', async () => {
+    page.setDefaultTimeout(5000);
+    state.draftPages = [sourceIds(100, 50), sourceIds(150, 5)];
+    state.draftRowDelay = 1800;
+    state.draftLoadingIcon = true;
+    const queue = await drafts.scanDrafts(page, () => {});
+    assert.equal(queue.length, 55);
+    assert.equal(queue.at(-1).key, sourceId(154));
+});
+
+for (const problem of ['draftsNeverReady', 'blankDraftPage']) {
+    test(`an unfinished draft page (${problem}) cannot be accepted as an empty completed scan`, async () => {
+        page.setDefaultTimeout(1500);
+        state[problem] = true;
+        const logs = [];
+        await assert.rejects(drafts.scanDrafts(page, message => logs.push(message)), /draft page .*ready|draft page .*load/i);
+        assert.equal(logs.some(message => message.includes('Scan complete')), false);
+        assert.equal(state.posts, 0);
+    });
+}
+
+test('draft scanning waits for a listing-data response before accepting stable partial rows', async () => {
+    page.setDefaultTimeout(5000);
+    state.draftPages = [sourceIds(100, 50), sourceIds(150, 5)];
+    state.draftDataDelay = 1800;
+    state.backgroundDraftTraffic = true;
+    const queue = await drafts.scanDrafts(page, () => {});
+    assert.equal(queue.length, 55);
+    assert.equal(queue.at(-1).key, sourceId(154));
+    assert.equal(state.posts, 0);
+});
+
+test('unfinished listing-data requests cannot turn a partial page into a complete queue', async () => {
+    state.drafts = 2;
+    state.draftDataNeverReady = true;
+    const logs = [];
+    await assert.rejects(drafts.scanDrafts(page, message => logs.push(message)), /listing-data requests=1.*\/api\/listings/);
+    assert.equal(logs.some(message => message.includes('Scan complete')), false);
+    assert.equal(state.posts, 0);
 });
 
 test('clicks the real copy button inside its wrapper and accepts an anchor Done control', async () => {

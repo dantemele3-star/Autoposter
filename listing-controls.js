@@ -15,7 +15,7 @@ async function trackPageNetwork(page) {
         session.on('Network.requestWillBeSent', request => {
             if (request.frameId === state.frameId && request.type !== 'Document' &&
                 request.loaderId && request.loaderId !== state.loaderId) return;
-            state.pending.set(request.requestId, request.loaderId);
+            state.pending.set(request.requestId, { loaderId: request.loaderId, type: request.type, url: request.request.url });
             changed();
         });
         const finished = ({ requestId }) => { if (state.pending.delete(requestId)) changed(); };
@@ -25,7 +25,7 @@ async function trackPageNetwork(page) {
             if (frame.parentId) return;
             state.frameId = frame.id;
             state.loaderId = frame.loaderId;
-            for (const [id, loader] of state.pending) if (loader !== frame.loaderId) state.pending.delete(id);
+            for (const [id, request] of state.pending) if (request.loaderId !== frame.loaderId) state.pending.delete(id);
             changed();
         });
         await Promise.all([session.send('Network.enable'), session.send('Page.enable')]);
@@ -36,6 +36,17 @@ async function trackPageNetwork(page) {
         return state;
     })());
     return networkStates.get(page);
+}
+
+async function pendingListingRequests(page) {
+    const state = await trackPageNetwork(page);
+    return [...state.pending.values()].filter(request => {
+        if (!['XHR', 'Fetch'].includes(request.type)) return false;
+        return /\/(?:listings?|drafts?|graphql|search)(?:\/|$)/i.test(new URL(request.url).pathname);
+    }).map(request => {
+        const url = new URL(request.url);
+        return `${url.origin}${url.pathname}`; // No queries, credentials or headers in diagnostics.
+    });
 }
 
 function listingId(url) {
@@ -249,7 +260,12 @@ async function settle(page) {
     while (state.pending.size || Date.now() - Math.max(started, state.changed) < 500) {
         if (page.isClosed()) throw new Error('Browser page closed while waiting for the current page to settle.');
         if (Date.now() >= deadline) {
-            throw new Error(`Timed out waiting for the current page's requests to settle (${state.pending.size} pending).`);
+            const details = [...state.pending.values()].filter(request => /^https?:/.test(request.url)).slice(0, 3).map(request => {
+                const url = new URL(request.url);
+                return `${request.type} ${url.origin}${url.pathname}`;
+            });
+            throw new Error(`Timed out waiting for the current page's requests to settle (${state.pending.size} pending).` +
+                (details.length ? ` Pending: ${details.join(', ')}` : ''));
         }
         await sleep(50);
     }
@@ -456,5 +472,5 @@ async function waitForPublished(page, context, {
 
 module.exports = {
     listingId, findControl, clickElement, clickControl, waitForControl, navigate, dismissPopup,
-    deleteOldestListing, capturePublication, waitForPublished, settle, usablePageResponse
+    deleteOldestListing, capturePublication, waitForPublished, settle, usablePageResponse, pendingListingRequests
 };

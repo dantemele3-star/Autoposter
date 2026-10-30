@@ -6,7 +6,7 @@ const os = require('os');
 
 const {
     clickControl, waitForControl, navigate, dismissPopup,
-    deleteOldestListing, capturePublication, waitForPublished, settle
+    deleteOldestListing, capturePublication, waitForPublished
 } = require('./listing-controls');
 const { scanDrafts, openDraft } = require('./drafts');
 const { PostingBudget, DAILY_LIMIT } = require('./posting-budget');
@@ -81,7 +81,7 @@ async function processDrafts(run, config, budget) {
         log(`Mode: ${config.headless ? 'Headless (Hidden)' : 'Headed (Visible)'}`);
         log(`Tracked app submissions in the last 24 hours: ${budget.status().count}/${DAILY_LIMIT}. Browser actions are spaced by at least 2 seconds.`);
         run.step('Navigating to Gameflip Drafts');
-        await navigate(page, 'https://gameflip.com/listings/draft');
+        await navigate(page, 'https://gameflip.com/listings/draft', { waitForIdle: false });
 
         if (page.url().includes('login')) {
             run.step('Waiting for manual Gameflip login');
@@ -124,7 +124,6 @@ async function processDrafts(run, config, budget) {
             await dismissPopup(page);
             run.step('Waiting for Done in the draft editor');
             await clickControl(page, 'done');
-            await settle(page);
             await dismissPopup(page);
             // Wait for the preview before capturing the new copy's ID.
             run.step('Waiting for List Item in the listing preview');
