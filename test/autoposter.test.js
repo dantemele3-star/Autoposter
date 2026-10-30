@@ -45,7 +45,16 @@ beforeEach(async () => {
         state.visits.push(url.pathname);
         state.requests.push(url.href);
         let body;
-        if (url.pathname === '/fixture/sorted') {
+        if (url.pathname === '/fixture/background') {
+            // Polling keeps the draft document busy. Individual responses still
+            // complete, so leaving that document can drain the outstanding work.
+            await new Promise(resolve => global.setTimeout(resolve, 150));
+            try { await request.respond({ status: 200, contentType: 'application/json', body: '{}' }); }
+            catch (error) {
+                if (!/closed|No resource|Invalid InterceptionId/i.test(error.message)) throw error;
+            }
+            return;
+        } else if (url.pathname === '/fixture/sorted') {
             await new Promise(resolve => global.setTimeout(resolve, 80));
             body = JSON.stringify([...state.listings].sort());
         } else if (url.pathname === '/fixture/publish') {
@@ -84,6 +93,7 @@ afterEach(async () => {
 // access is used; these fixtures reproduce the competing navigation/dropdowns.
 function fixture(url) {
     const id = controls.listingId(url.href);
+    const backgroundPolling = '<script>fetch("/fixture/background").catch(() => {}); setInterval(() => fetch("/fixture/background").catch(() => {}), 100)</script>';
     let content = '';
     if (url.pathname === '/listings/draft') {
         const pages = state.draftPages || [[NEW, NEXT].slice(0, state.drafts)];
@@ -107,6 +117,7 @@ function fixture(url) {
                 <a aria-label="Next" href="?page=${number + 1}&limit=50">Next</a></li></ul>`;
         }
         if (state.popup) content += '<div class="modal" role="dialog"><button onclick="this.parentElement.style.display=\'none\'">Not now</button></div>';
+        if (state.backgroundDraftTraffic) content += backgroundPolling;
     } else if (url.pathname.endsWith('/edit')) {
         const preview = state.queryEditor ? `/listing/preview?id=${id}` : `/listings/${id}/preview`;
         content = state.anchorDone
@@ -151,6 +162,7 @@ function fixture(url) {
             }
         </script>`;
         if (state.salePopup) content += notificationPrompt("fetch('/fixture/decline'); this.closest('.notification-prompt').remove()");
+        if (state.backgroundOnSaleTraffic) content += backgroundPolling;
     } else if (id) {
         const icon = state.actionIcon === 'svg' ? '<svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="2" /></svg>'
             : `<i class="${state.actionIcon || 'fa-ellipsis-h'}" aria-hidden="true"></i>`;
@@ -192,7 +204,7 @@ function notificationPrompt(decline, custom = false) {
 }
 
 function mainProcess({ random = Math.random, skipWaits = false, stateFolder, launchError, closeError, clipboard,
-    publicationTimeoutMs = 1500 } = {}) {
+    publicationTimeoutMs = 1500, onLog = () => {} } = {}) {
     if (!stateFolder) {
         stateFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'autoposter-state-test-'));
         stateFolders.push(stateFolder);
@@ -200,7 +212,7 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
     const handlers = new Map();
     const logs = [];
     const openedLogs = [];
-    const win = { isDestroyed: () => false, webContents: { send: (_, message) => logs.push(message) } };
+    const win = { isDestroyed: () => false, webContents: { send: (_, message) => { logs.push(message); onLog(message); } } };
     let closed = false;
     const fakeBrowser = Object.assign(new EventEmitter(), { pages: async () => [page], close: async () => {
         closed = true;
@@ -556,14 +568,16 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     state.actionIcon = 'svg';
     state.textOnlyDelete = true;
     let randomCalls = 0;
-    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999 });
+    const main = mainProcess({ random: () => randomCalls++ === 0 ? 0 : 0.999999, onLog: message => {
+        if (message.includes('Scan complete: 105 unique drafts')) state.backgroundDraftTraffic = true;
+    } });
     let outcome;
     const run = main.handlers.get('process-drafts')({ sender: {} }, { randomize: true, maintainLimit: true })
         .then(result => { outcome = result; return result; });
     try {
         const deadline = Date.now() + 20000;
         while (!main.logs.some(message => message.includes('Rate Limit Protection'))) {
-            assert.equal(outcome, undefined, outcome?.error || 'Run ended before count maintenance');
+            assert.equal(outcome, undefined, JSON.stringify({ outcome, logs: main.logs }));
             assert.ok(Date.now() < deadline, 'Did not finish count maintenance');
             await new Promise(resolve => setTimeout(resolve, 20));
         }
@@ -813,6 +827,14 @@ test('missing Oldest option stops without deleting any listing', async () => {
     assert.deepEqual(state.deleted, []);
 });
 
+test('current On Sale traffic still blocks deletion instead of guessing sorted rows', async () => {
+    state.listings.unshift(NEW);
+    state.backgroundOnSaleTraffic = true;
+    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /current page's requests to settle/);
+    assert.deepEqual(state.deleted, []);
+    assert.deepEqual(state.listings, [NEW, RECENT, OLD]);
+});
+
 test('failed server deletion is reported, not counted as successful', async () => {
     state.rejectDelete = true;
     await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /still On Sale/);
@@ -966,7 +988,7 @@ test('the GUI captures the checkbox and locks settings until posting finishes', 
 test('Copy Logs writes and verifies Unicode logs through the main-process clipboard', async () => {
     let copied;
     const main = mainProcess({ clipboard: {
-        writeText: text => { copied = text.replace(/\n/g, '\r\n'); }, readText: () => copied
+        writeText: async text => { copied = text.replace(/\n/g, '\r\n'); }, readText: async () => copied
     } });
     const result = await main.handlers.get('copy-logs')({}, '✅ Publication confirmed.\n🧹 Oldest listing deletion verified.');
     assert.equal(result.success, true);
@@ -974,11 +996,11 @@ test('Copy Logs writes and verifies Unicode logs through the main-process clipbo
 });
 
 test('Copy Logs reports Windows clipboard errors, silent failures and invalid input', async () => {
-    const broken = mainProcess({ clipboard: { writeText() { throw new Error('Clipboard is busy'); } } });
+    const broken = mainProcess({ clipboard: { async writeText() { throw new Error('Clipboard is busy'); } } });
     const failed = await broken.handlers.get('copy-logs')({}, 'Run diagnostics');
     assert.equal(failed.success, false);
     assert.match(failed.error, /Clipboard is busy/);
-    const unchanged = mainProcess({ clipboard: { writeText() {}, readText: () => 'old clipboard' } });
+    const unchanged = mainProcess({ clipboard: { async writeText() {}, readText: async () => 'old clipboard' } });
     const silentFailure = await unchanged.handlers.get('copy-logs')({}, 'New diagnostics');
     assert.equal(silentFailure.success, false);
     assert.match(silentFailure.error, /did not retain/);
@@ -987,6 +1009,39 @@ test('Copy Logs reports Windows clipboard errors, silent failures and invalid in
         assert.equal(invalid.success, false);
         assert.match(invalid.error, /no logs to copy/);
     }
+});
+
+test('Copy Logs waits for an asynchronous write before reading and reporting success', async () => {
+    let finishWrite, copied, reads = 0;
+    const main = mainProcess({ clipboard: {
+        writeText: text => new Promise(resolve => { finishWrite = () => { copied = text; resolve(); }; }),
+        readText: async () => { reads++; return copied; }
+    } });
+    const pending = main.handlers.get('copy-logs')({}, 'Latest diagnostics');
+    assert.equal(reads, 0, 'Must not read the clipboard before the write resolves');
+    finishWrite();
+    const result = await pending;
+    assert.equal(result.success, true, result.error);
+    assert.equal(reads, 1);
+    const unreadable = mainProcess({ clipboard: {
+        async writeText() {}, async readText() { throw new Error('Clipboard access denied'); }
+    } });
+    const failure = await unreadable.handlers.get('copy-logs')({}, 'Latest diagnostics');
+    assert.equal(failure.success, false);
+    assert.match(failure.error, /Clipboard access denied/);
+});
+
+test('opening a scanned draft uses rendered controls despite pending background traffic', async () => {
+    const queue = await drafts.scanDrafts(page, () => {});
+    state.backgroundDraftTraffic = true;
+    await page.goto('https://gameflip.com/listings/draft?page=1&limit=50', { waitUntil: 'domcontentloaded' });
+    await assert.rejects(page.waitForNetworkIdle({ idleTime: 50, timeout: 150 }), /Timed out/);
+    assert.equal(await page.$$eval('.tool-duplicate', els => els.length), 1);
+    assert.equal(await drafts.openDraft(page, queue[0], () => {}), true);
+    const ready = await controls.waitForControl(page, 'done');
+    await ready.dispose();
+    assert.equal(new URL(page.url()).pathname, `/listings/${NEW}/edit`);
+    assert.deepEqual(state.published, []);
 });
 
 test('Copy Logs flushes pending messages, prevents duplicate requests and exposes failures in the GUI', async () => {

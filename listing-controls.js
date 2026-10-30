@@ -3,6 +3,40 @@ const { CONFIRMATION_TIMEOUT_MS } = require('./posting-budget');
 
 const ORIGIN = 'https://gameflip.com';
 const ON_SALE = `${ORIGIN}/listings/onsale`;
+const networkStates = new WeakMap();
+
+async function trackPageNetwork(page) {
+    if (!networkStates.has(page)) networkStates.set(page, (async () => {
+        // Raw lifecycle events retain the document/loader identity and are not
+        // delayed by Puppeteer's queued request-interception callbacks.
+        const session = await page.createCDPSession();
+        const state = { pending: new Map(), changed: Date.now() };
+        const changed = () => { state.changed = Date.now(); };
+        session.on('Network.requestWillBeSent', request => {
+            if (request.frameId === state.frameId && request.type !== 'Document' &&
+                request.loaderId && request.loaderId !== state.loaderId) return;
+            state.pending.set(request.requestId, request.loaderId);
+            changed();
+        });
+        const finished = ({ requestId }) => { if (state.pending.delete(requestId)) changed(); };
+        session.on('Network.loadingFinished', finished);
+        session.on('Network.loadingFailed', finished);
+        session.on('Page.frameNavigated', ({ frame }) => {
+            if (frame.parentId) return;
+            state.frameId = frame.id;
+            state.loaderId = frame.loaderId;
+            for (const [id, loader] of state.pending) if (loader !== frame.loaderId) state.pending.delete(id);
+            changed();
+        });
+        await Promise.all([session.send('Network.enable'), session.send('Page.enable')]);
+        const { frameTree } = await session.send('Page.getFrameTree');
+        state.frameId = frameTree.frame.id;
+        state.loaderId = frameTree.frame.loaderId;
+        page.once('close', () => { state.pending.clear(); session.detach().catch(() => {}); });
+        return state;
+    })());
+    return networkStates.get(page);
+}
 
 function listingId(url) {
     try {
@@ -103,6 +137,7 @@ async function parkPointer(page) {
 }
 
 async function clickElement(page, element, { useMouse = false, verify, beforeClick, paced = false } = {}) {
+    await trackPageNetwork(page);
     if (!paced) await paceAction(page);
     if (verify) await verify();
     await parkPointer(page);
@@ -206,17 +241,29 @@ async function popupControl(page) {
 }
 
 async function settle(page) {
+    const state = await trackPageNetwork(page);
     await dismissPopup(page);
-    await page.waitForNetworkIdle({ idleTime: 500 });
+    const timeout = page.getDefaultTimeout();
+    const started = Date.now();
+    const deadline = timeout ? started + timeout : Infinity;
+    while (state.pending.size || Date.now() - Math.max(started, state.changed) < 500) {
+        if (page.isClosed()) throw new Error('Browser page closed while waiting for the current page to settle.');
+        if (Date.now() >= deadline) {
+            throw new Error(`Timed out waiting for the current page's requests to settle (${state.pending.size} pending).`);
+        }
+        await sleep(50);
+    }
     await dismissPopup(page);
 }
 
-async function navigate(page, url) {
+async function navigate(page, url, { waitForIdle = true } = {}) {
+    await trackPageNetwork(page);
     await paceAction(page);
     const response = await page.goto(url, { waitUntil: 'domcontentloaded' });
     await parkPointer(page);
     completeAction(page);
-    await settle(page);
+    if (waitForIdle) await settle(page);
+    else await dismissPopup(page);
     completeAction(page);
     return response;
 }

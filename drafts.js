@@ -1,4 +1,4 @@
-const { clickElement, navigate, settle, dismissPopup, usablePageResponse } = require('./listing-controls');
+const { clickElement, navigate, dismissPopup, usablePageResponse } = require('./listing-controls');
 const { paceAction } = require('./pacing');
 
 const PAGE_SIZE = 50;
@@ -59,15 +59,15 @@ async function snapshot(page) {
     return { rows, signature: JSON.stringify(rows.map(row => row.key)) };
 }
 
-async function loadPage(page, ordinal, log) {
-    let response = await navigate(page, draftUrl(ordinal));
+async function loadPage(page, ordinal, log, navigationOptions) {
+    let response = await navigate(page, draftUrl(ordinal), navigationOptions);
     // A 304 with no usable cached body must not turn a full queue into a
     // seemingly complete partial scan. Confirm an empty page without cache.
     const hasDraftControls = () => page.evaluate(() => Boolean(document.querySelector('.tool-duplicate')));
     if (response?.status() === 304 && !await hasDraftControls()) {
         log(`Draft page ${ordinal}: cached response has no draft controls; checking once without cache...`);
         await page.setCacheEnabled(false);
-        try { response = await navigate(page, draftUrl(ordinal)); }
+        try { response = await navigate(page, draftUrl(ordinal), navigationOptions); }
         finally { await page.setCacheEnabled(true); }
         if (response?.status() === 304 && !await hasDraftControls()) {
             throw new Error(`Draft page ${ordinal} still has no usable cached draft content; posting paused.`);
@@ -120,7 +120,12 @@ async function scanDrafts(page, log, stopped = () => false) {
 }
 
 async function openDraft(page, draft, log, stopped = () => false) {
-    let current = (await loadPage(page, draft.page, log)).rows.find(row => row.key === draft.key);
+    // This page was already scanned in full. Background traffic can keep Chrome
+    // permanently non-idle even with all draft controls rendered. DOMContentLoaded
+    // is enough here: loadPage validates the response/section/identities, and we
+    // recheck the selected ID below and immediately before the actual click.
+    log(`Reopening draft page ${draft.page}; checking the selected source ID in the rendered controls...`);
+    let current = (await loadPage(page, draft.page, log, { waitForIdle: false })).rows.find(row => row.key === draft.key);
     if (!current) {
         log(`Draft moved from scanned page ${draft.page}; locating it by listing ID...`);
         current = await walkPages(page, rows => rows.find(row => row.key === draft.key), log, stopped);
@@ -145,7 +150,9 @@ async function openDraft(page, draft, log, stopped = () => false) {
     } finally {
         await Promise.all(buttons.map(button => button.dispose()));
     }
-    await settle(page);
+    // The caller waits for the editor's Done control. Background requests on
+    // the old page are not a useful readiness signal for that transition.
+    await dismissPopup(page);
     return true;
 }
 

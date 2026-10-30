@@ -70,10 +70,15 @@ original draft again instead of clicking its old row number. Newly appearing
 drafts are picked up in the next cycle. The log names the copy, Done, preview,
 and submission steps so a timeout identifies which step failed.
 
+Reopening a scanned draft checks its rendered source ID without requiring all
+background traffic to stop. Other page-settling waits track Chrome's current
+document, so requests from an earlier page cannot hold up the next step. Current
+page requests still have to settle before using the oldest-sorted listings.
+
 ## Share a failure log
 
 Click **Copy Logs** after a failure and paste the result when reporting it. The
-app copies through Electron's main process and checks the clipboard before
+app awaits Electron's main-process clipboard write and read before
 showing **Copied**. If copying fails, the button shows **Copy failed** and the log
 explains the error; use **Open Logs Folder** to access the saved file instead.
 
@@ -166,10 +171,10 @@ overlapping runs, stopping, and loop rate limiting. They do not use your login
 profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.
 
-Regression coverage also checks main-process clipboard writes and failures,
+Regression coverage also checks asynchronous main-process clipboard writes and failures,
 menu ownership with different icons and text-only Delete entries, rejection of
 ambiguous/account menus, and a full 105-draft scan through publication and count
-maintenance.
+maintenance, including background polling after scanning.
 
 For the prepared Linux cloud checkout (which already has system Chromium):
 
