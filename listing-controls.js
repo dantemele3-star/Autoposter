@@ -10,15 +10,27 @@ async function trackPageNetwork(page) {
         // Raw lifecycle events retain the document/loader identity and are not
         // delayed by Puppeteer's queued request-interception callbacks.
         const session = await page.createCDPSession();
-        const state = { pending: new Map(), changed: Date.now() };
+        const state = { pending: new Map(), tracking: new Set(), changed: Date.now() };
         const changed = () => { state.changed = Date.now(); };
         session.on('Network.requestWillBeSent', request => {
+            if (state.tracking.has(request.requestId)) return;
+            const mainDocument = request.type === 'Document' && request.frameId === state.frameId;
+            // Facebook's /tr pixel can be a never-finishing child Document.
+            // It is not Gameflip data or a prerequisite for sorting/deletion.
+            if (!mainDocument && facebookTrackingPixel(request.request.url)) {
+                state.tracking.add(request.requestId); // Includes subsequent redirects of this pixel.
+                if (state.pending.delete(request.requestId)) changed();
+                return;
+            }
             if (request.frameId === state.frameId && request.type !== 'Document' &&
                 request.loaderId && request.loaderId !== state.loaderId) return;
             state.pending.set(request.requestId, { loaderId: request.loaderId, type: request.type, url: request.request.url });
             changed();
         });
-        const finished = ({ requestId }) => { if (state.pending.delete(requestId)) changed(); };
+        const finished = ({ requestId }) => {
+            state.tracking.delete(requestId);
+            if (state.pending.delete(requestId)) changed();
+        };
         session.on('Network.loadingFinished', finished);
         session.on('Network.loadingFailed', finished);
         session.on('Page.frameNavigated', ({ frame }) => {
@@ -32,10 +44,17 @@ async function trackPageNetwork(page) {
         const { frameTree } = await session.send('Page.getFrameTree');
         state.frameId = frameTree.frame.id;
         state.loaderId = frameTree.frame.loaderId;
-        page.once('close', () => { state.pending.clear(); session.detach().catch(() => {}); });
+        page.once('close', () => { state.pending.clear(); state.tracking.clear(); session.detach().catch(() => {}); });
         return state;
     })());
     return networkStates.get(page);
+}
+
+function facebookTrackingPixel(value) {
+    try {
+        const url = new URL(value);
+        return /(^|\.)facebook\.com$/i.test(url.hostname) && /^\/tr\/?$/.test(url.pathname);
+    } catch { return false; }
 }
 
 async function pendingListingRequests(page) {
@@ -266,10 +285,10 @@ function missingFrameOwner(error) {
     return false;
 }
 
-async function settle(page) {
+async function settle(page, { timeoutMs } = {}) {
     const state = await trackPageNetwork(page);
     await dismissPopup(page);
-    const timeout = page.getDefaultTimeout();
+    const timeout = timeoutMs === undefined ? page.getDefaultTimeout() : Math.max(1, timeoutMs);
     const started = Date.now();
     const deadline = timeout ? started + timeout : Infinity;
     while (state.pending.size || Date.now() - Math.max(started, state.changed) < 500) {
@@ -287,15 +306,27 @@ async function settle(page) {
     await dismissPopup(page);
 }
 
-async function navigate(page, url, { waitForIdle = true } = {}) {
+async function navigate(page, url, { waitForIdle = true, timeoutMs } = {}) {
+    const deadline = timeoutMs === undefined ? null : Date.now() + timeoutMs;
+    const remaining = () => {
+        if (deadline === null) return undefined;
+        const ms = deadline - Date.now();
+        if (ms <= 0) {
+            const error = new Error('Navigation exhausted the remaining publication-confirmation window.');
+            error.name = 'TimeoutError';
+            throw error;
+        }
+        return Math.max(1, Math.min(ms, page.getDefaultTimeout() || ms));
+    };
     await trackPageNetwork(page);
     await paceAction(page);
-    const response = await page.goto(url, { waitUntil: 'domcontentloaded' });
+    const response = await page.goto(url, { waitUntil: 'domcontentloaded', timeout: remaining() });
     await parkPointer(page);
     completeAction(page);
-    if (waitForIdle) await settle(page);
+    if (waitForIdle) await settle(page, { timeoutMs: remaining() });
     else await dismissPopup(page);
     completeAction(page);
+    remaining();
     return response;
 }
 
@@ -446,10 +477,11 @@ async function capturePublication(page) {
 async function findPostedOnSale(page, id, deadline) {
     const seen = new Set();
     for (let number = 1; ; number++) {
-        const response = await navigate(page, `${ON_SALE}?page=${number}&limit=50`);
+        if (Date.now() >= deadline) return false;
+        const response = await navigate(page, `${ON_SALE}?page=${number}&limit=50`, { timeoutMs: deadline - Date.now() });
         if (!usablePageResponse(response) || new URL(page.url()).pathname.replace(/\/$/, '') !== '/listings/onsale') return false;
         const ids = [...new Set((await activeListingLinks(page)).map(listingId))];
-        if (ids.includes(id)) return true;
+        if (ids.includes(id)) return Date.now() < deadline;
         const signature = JSON.stringify(ids);
         if (ids.length < 50 || seen.has(signature) || Date.now() >= deadline) return false;
         seen.add(signature);
@@ -464,7 +496,10 @@ async function waitForPublished(page, context, {
     const deadline = Date.now() + timeoutMs;
     let state;
     try {
-        const result = await waitWithPopups(page, publicationDOM, [context], timeoutMs);
+        // A captured copy ID is enough to begin read-only On Sale checks after
+        // a short grace for late prompts. An unchanged preview is not a failure.
+        const observationMs = context.id ? Math.max(1, Math.min(5000, timeoutMs / 3)) : Math.max(1, timeoutMs);
+        const result = await waitWithPopups(page, publicationDOM, [context], observationMs);
         try { state = await result.jsonValue(); } finally { await result.dispose(); }
     } catch (error) {
         if (error.name !== 'TimeoutError') throw error;
@@ -477,12 +512,27 @@ async function waitForPublished(page, context, {
         throw new Error('On Sale/publication was reached without an identifiable copied listing ID. The submission may have posted; check Gameflip before restarting. No deletion was attempted.');
     }
     log('Verifying the submitted listing in On Sale (without submitting it again)...');
+    let lastVerificationError;
     do {
-        if (await findPostedOnSale(page, id, Math.max(deadline, Date.now() + 10000))) return id;
+        if (Date.now() >= deadline) break;
+        try {
+            if (await findPostedOnSale(page, id, deadline)) return id;
+        } catch (error) {
+            const transient = error.name === 'TimeoutError' || changingContext(error) ||
+                /^Timed out waiting for the current page's requests to settle/.test(error.message);
+            if (page.isClosed() || !transient) {
+                throw new Error(`The submission was recorded, but On Sale verification failed: ${error.message} ` +
+                    'Check Gameflip before restarting. It was not submitted again, and no deletion was attempted.', { cause: error });
+            }
+            lastVerificationError = error;
+            if (Date.now() < deadline) log('On Sale check timed out or changed during navigation; retrying read-only within the confirmation window...');
+        }
         if (state.kind === 'error' || Date.now() >= deadline) break;
         await sleep(Math.min(retryDelayMs, deadline - Date.now()));
     } while (Date.now() < deadline);
-    throw new Error('The submission was recorded, but the listing could not be verified in On Sale. It may have posted; check Gameflip before restarting. No retry or deletion was attempted.');
+    throw new Error('The submission was recorded, but the listing could not be verified in On Sale. ' +
+        'It may have posted; check Gameflip before restarting. It was not submitted again, and no deletion was attempted.',
+        { cause: lastVerificationError });
 }
 
 module.exports = {

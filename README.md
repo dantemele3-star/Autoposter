@@ -147,6 +147,15 @@ the copied listing's ID, including subsequent pages. A List Item button on the
 On Sale page does not prevent confirmation. Verification only reads pages; it
 does not click List Item again.
 
+When the copied ID is already known, an unchanged preview gets a short grace
+period (at most five seconds) for late prompts, then verification starts in On
+Sale. Navigation and retries share the original confirmation window. Facebook's
+`facebook.com/tr/` tracking pixel is excluded from readiness waits, including
+when it is a pending iframe Document or redirects to another pixel endpoint.
+Gameflip data and non-tracking documents
+still have to settle before deletion. A verification failure keeps its recorded
+submission and reports the uncertain outcome without submitting again.
+
 There is a minimum 220-second cooldown after a submission and its verification
 or count maintenance finish. Stop, restart, and continuous loops preserve that
 cooldown. A single-instance lock prevents a second copy of the app running at

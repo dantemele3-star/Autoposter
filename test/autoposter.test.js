@@ -45,7 +45,14 @@ beforeEach(async () => {
         state.visits.push(url.pathname);
         state.requests.push(url.href);
         let body;
-        if (url.pathname === '/api/listings') {
+        if (url.hostname === 'www.facebook.com' && ['/tr/', '/dialog/oauth', '/privacy_sandbox/pixel/register/trigger/'].includes(url.pathname)) {
+            // Reproduce the log's tracking Document that never finishes.
+            state.facebookRequests = (state.facebookRequests || 0) + 1;
+            if (state.facebookRedirect && url.pathname === '/tr/') {
+                await request.respond({ status: 302, headers: { location: 'https://www.facebook.com/privacy_sandbox/pixel/register/trigger/' } });
+            }
+            return;
+        } else if (url.pathname === '/api/listings') {
             if (state.draftDataNeverReady) return;
             await new Promise(resolve => global.setTimeout(resolve, state.draftDataDelay));
             try { await request.respond({ status: 200, contentType: 'application/json', body: '{}' }); }
@@ -91,6 +98,21 @@ beforeEach(async () => {
         await request.respond({ status: state.documentStatus?.(url) || 200,
             contentType: url.pathname.startsWith('/fixture/') ? 'application/json' : 'text/html', body });
     });
+    const goto = page.goto.bind(page);
+    page.goto = async (url, options) => {
+        const response = await goto(url, options);
+        if (state.facebookTracking) {
+            // The reported navigation had already completed before readiness
+            // was blocked by the tracker; reproduce that ordering explicitly.
+            await page.evaluate(path => {
+                const tracker = document.createElement('iframe');
+                tracker.style.display = 'none';
+                tracker.src = `https://www.facebook.com${path}`;
+                document.body.appendChild(tracker);
+            }, state.facebookPath || '/tr/');
+        }
+        return response;
+    };
 });
 afterEach(async () => {
     if (page && !page.isClosed()) await page.close();
@@ -160,7 +182,9 @@ function fixture(url) {
             : notificationPrompt(state.stickyPrompt ? '' : 'declinePrompt()', state.postPopup === 'custom');
         content = `<button onclick="submitFixtureListing()">List Item</button><div id="error" role="alert"></div>
             <script>
-                function declinePrompt() { fetch('/fixture/decline').then(() => location.href='/listings/onsale'); }
+                function declinePrompt() { fetch('/fixture/decline').then(() => {
+                    ${state.stayPreviewAfterPrompt ? "document.querySelector('.notification-prompt').remove()" : "location.href='/listings/onsale'"}
+                }); }
                 window.addEventListener('message', event => { if(event.data === 'declined') {
                     document.querySelector('#notification-frame').remove(); declinePrompt();
                 }});
@@ -235,7 +259,7 @@ function notificationPrompt(decline, custom = false) {
 }
 
 function mainProcess({ random = Math.random, skipWaits = false, stateFolder, launchError, closeError, clipboard,
-    publicationTimeoutMs = 1500, onLog = () => {} } = {}) {
+    publicationTimeoutMs = 5000, onLog = () => {} } = {}) {
     if (!stateFolder) {
         stateFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'autoposter-state-test-'));
         stateFolders.push(stateFolder);
@@ -599,6 +623,9 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     state.actionIcon = 'svg';
     state.textOnlyDelete = true;
     state.backgroundDraftTraffic = true;
+    state.facebookTracking = true;
+    state.postPopup = 'inline';
+    state.stayPreviewAfterPrompt = true;
     let randomCalls = 0;
     let frameRaces = 0;
     page.on('frameattached', frame => {
@@ -620,7 +647,7 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
         const deadline = Date.now() + 20000;
         while (!main.logs.some(message => message.includes('Rate Limit Protection'))) {
             assert.equal(outcome, undefined, JSON.stringify({ outcome, logs: main.logs }));
-            assert.ok(Date.now() < deadline, 'Did not finish count maintenance');
+            assert.ok(Date.now() < deadline, `Did not finish count maintenance: ${JSON.stringify(main.logs.slice(-12))}`);
             await new Promise(resolve => setTimeout(resolve, 20));
         }
     } finally {
@@ -938,6 +965,61 @@ test('a submitted listing left on the preview is verified read-only after the UI
     assert.equal(state.posts, 1);
 });
 
+test('a pending Facebook tracking document cannot block publication verification or oldest maintenance', async () => {
+    state.facebookTracking = true;
+    state.postPopup = 'inline';
+    state.stayPreviewAfterPrompt = true;
+    const main = mainProcess({ publicationTimeoutMs: 5000 });
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+    assert.equal(result.success, true, JSON.stringify({ result, logs: main.logs }));
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.equal(state.declines, 1);
+    assert.equal(state.accepts || 0, 0);
+    assert.ok(state.facebookRequests > 0);
+    assert.equal(JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json'))).submissions.length, 1);
+});
+
+test('non-tracking Facebook documents are still awaited before deleting listings', async () => {
+    state.facebookTracking = true;
+    state.facebookPath = '/dialog/oauth';
+    state.listings.unshift(NEW);
+    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /current page's requests.*facebook\.com\/dialog\/oauth/);
+    assert.deepEqual(state.deleted, []);
+});
+
+test('redirects of the identified Facebook pixel remain excluded from readiness', async () => {
+    state.facebookTracking = true;
+    state.facebookRedirect = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+    assert.equal(result.success, true, JSON.stringify({ result, logs: main.logs }));
+    assert.equal(state.posts, 1);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.ok(state.requests.some(url => new URL(url).pathname === '/privacy_sandbox/pixel/register/trigger/'));
+});
+
+test('known-ID verification bounds navigation by its remaining window and never submits again', async () => {
+    state.stayPreview = true;
+    state.rejectPost = true;
+    await controls.navigate(page, `https://gameflip.com/listings/${NEW}/preview`);
+    // No success/rejection UI hint: exercise the complete observation budget.
+    await page.$eval('#error', el => el.removeAttribute('role'));
+    await page.evaluate(() => document.querySelector('button').onclick = () => {});
+    const goto = page.goto.bind(page);
+    const navigationTimeouts = [];
+    page.goto = (url, options) => { navigationTimeouts.push(options.timeout); return goto(url, options); };
+    await assert.rejects(controls.waitForPublished(page, { id: NEW, before: [] }, {
+        timeoutMs: 800, retryDelayMs: 20
+    }), /could not be verified in On Sale/);
+    assert.ok(navigationTimeouts.length > 0, 'Read-only verification should begin before the observation window is exhausted');
+    assert.ok(navigationTimeouts.every(timeout => timeout > 0 && timeout <= 800),
+        'Each navigation must receive a bounded share of the existing confirmation window');
+    assert.equal(state.posts, 0);
+    assert.deepEqual(state.deleted, []);
+});
+
 test('publication observation can outwait the ordinary page timeout and a visible List Item button', async () => {
     await page.setContent('<button>List Item</button><div id="feedback"></div>');
     const context = await controls.capturePublication(page);
@@ -1149,6 +1231,7 @@ test('the GUI captures the checkbox and locks settings until posting finishes', 
     assert.equal(await page.evaluate(() => window.calls.at(-1).channel), 'stop-drafts');
     await page.evaluate(() => window.finishRun({ success: false, postedCount: 1, error: 'Deletion not confirmed' }));
     await page.waitForFunction(() => !document.querySelector('#maintainLimit').disabled);
+    await page.waitForFunction(() => document.querySelector('#logContainer').textContent.includes('paused after 1 confirmed posts: Deletion not confirmed'));
     assert.match(await page.$eval('#logContainer', el => el.textContent), /paused after 1 confirmed posts: Deletion not confirmed/);
     assert.equal(await page.$eval('#maintainLimit', el => el.checked), true);
     await page.click('#copyLogs');
