@@ -85,9 +85,9 @@ function listingId(url) {
     }
 }
 
-// This function runs inside Chrome. Keep menus scoped to their own controls;
-// the profile dropdown and listing navigation must never become action targets.
-function findControl(action) {
+// This function runs inside Chrome. Resolve destructive controls by listing ID,
+// never by an icon elsewhere on the page or the row's changing numeric index.
+function findControl(action, context = {}) {
     const visible = el => el && el.getClientRects().length > 0 &&
         getComputedStyle(el).visibility !== 'hidden' && !el.closest('[aria-hidden="true"]');
     const content = el => !el.closest('header, nav, .navbar, [role="navigation"]');
@@ -97,34 +97,40 @@ function findControl(action) {
     const sort = () => buttons.find(el => el.matches('.dropdown-toggle') && /created\s*:/i.test(text(el)));
     const menuFor = el => el?.closest('.dropdown, .btn-group')?.querySelector('.dropdown-menu');
     const enabled = el => !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-    const listingMenu = () => {
-        if (!/^\/item\//.test(location.pathname)) return null;
-        const menuSelector = '.dropdown-menu, [role="menu"]';
-        const candidates = [];
-        for (const menu of document.querySelectorAll(menuSelector)) {
-            if (!content(menu) || menu.closest('.comment, .review, [data-comment-id], [data-review-id]')) continue;
-            const entries = [...menu.querySelectorAll('a, button, [role="menuitem"], [role="button"]')]
-                .filter(el => el.closest(menuSelector) === menu);
-            // Reject account menus even if the site's header markup changes.
-            if (entries.some(el => /\b(?:log\s*out|sign\s*out|my\s+profile)\b/i.test(text(el)) ||
-                /\/(?:logout|signout|profile|settings)(?:[/?#]|$)/i.test(el.getAttribute('href') || ''))) continue;
-            // The Delete entry identifies the seller menu, including while it
-            // is hidden. Icons (power, ellipsis, gear, SVG) are not identities.
-            const deletes = entries.filter(el => enabled(el) && /^delete(?: (?:item|listing))?$/i.test(text(el) || el.getAttribute('title') || ''));
-            if (deletes.length !== 1) continue;
-            const toggles = [...new Set([...buttons, ...document.querySelectorAll('.dropdown-toggle, [data-toggle="dropdown"], [data-bs-toggle="dropdown"]')])].filter(el => {
-                if (!visible(el) || !content(el) || !enabled(el)) return false;
-                if (menu.contains(el)) return false;
-                const ids = `${el.getAttribute('aria-controls') || ''} ${el.getAttribute('aria-owns') || ''}`.trim().split(/\s+/);
-                if (menu.id && ids.includes(menu.id)) return true;
-                const group = el.closest('.dropdown, .btn-group');
-                return group && group.querySelector(menuSelector) === menu &&
-                    el.closest(menuSelector) !== menu;
-            });
-            if (toggles.length === 1) candidates.push({ toggle: toggles[0], menu, delete: deletes[0] });
+    const oldestRow = () => {
+        if (location.origin !== 'https://gameflip.com' || location.pathname !== '/listings/onsale' ||
+            !context.oldestId || context.oldestId === context.publishedId ||
+            !/created\s*:\s*oldest/i.test(text(sort() || document.createElement('span')))) return null;
+        const idOf = value => {
+            try {
+                const url = new URL(value, location.href);
+                if (url.origin !== location.origin || !/^\/(?:item|listings?)\//.test(url.pathname)) return null;
+                const uuid = '[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}';
+                const id = url.pathname.match(new RegExp(`(?:^|/)(${uuid})(?:/|$)`, 'i'))?.[1];
+                if (id) return id.toLowerCase();
+                return ['id', '_id', 'listing', 'listingId', 'listing_id'].map(name => url.searchParams.get(name))
+                    .find(value => value && new RegExp(`^${uuid}$`, 'i').test(value))?.toLowerCase() || null;
+            } catch { return null; }
+        };
+        const links = [...document.querySelectorAll('a[href]')].filter(el => visible(el) && content(el) &&
+            !el.closest('.dropdown-menu, [role="menu"], .modal, [role="dialog"]') && idOf(el.href));
+        // Recheck sorting and identity after every popup/action pause. A refresh
+        // must not turn a saved row position into a different deletion target.
+        if (idOf(links[0]?.href) !== context.oldestId) return null;
+        const rows = new Set();
+        for (const link of links.filter(el => idOf(el.href) === context.oldestId)) {
+            for (let row = link.parentElement; row && row !== document.body; row = row.parentElement) {
+                const ids = new Set([...row.querySelectorAll('a[href]')].map(el => idOf(el.href)).filter(Boolean));
+                for (const el of [row, ...row.querySelectorAll('[data-listing-id], [data-id]')]) {
+                    const id = el.getAttribute('data-listing-id') || el.getAttribute('data-id');
+                    if (/^[a-f0-9]{8}-(?:[a-f0-9]{4}-){3}[a-f0-9]{12}$/i.test(id || '')) ids.add(id.toLowerCase());
+                }
+                // Stop before reaching a container shared with another listing.
+                if (ids.size !== 1 || !ids.has(context.oldestId)) break;
+                if (row.querySelector('button.tool-remove')) { rows.add(row); break; }
+            }
         }
-        // Never guess between multiple seller/delete menus on a listing page.
-        return candidates.length === 1 ? candidates[0] : null;
+        return rows.size === 1 ? [...rows][0] : null;
     };
 
     switch (action) {
@@ -135,12 +141,22 @@ function findControl(action) {
             return visible(menu) && [...menu.querySelectorAll('a, button, [role="menuitem"]')]
                 .find(el => visible(el) && /\boldest\b/i.test(text(el)));
         }
-        case 'listing-actions': return listingMenu()?.toggle || null;
-        case 'trash': {
-            const target = listingMenu();
-            return target && visible(target.menu) && visible(target.delete) && target.delete;
+        case 'row-remove': {
+            // Confirmed On Sale markup: tool-delist is "Take off Sale";
+            // tool-remove is "Delete". Never substitute the power/delist icon.
+            const row = oldestRow();
+            if (!row || buttons.some(el => el.closest('.modal, [role="dialog"]') && /^delete(?: (?:item|listing))?$/i.test(text(el)))) return null;
+            const removes = [...row.querySelectorAll('button.tool-remove')];
+            return removes.length === 1 && visible(removes[0]) && content(removes[0]) && enabled(removes[0]) &&
+                !removes[0].closest('.dropdown-menu, [role="menu"]') &&
+                /^delete(?: (?:item|listing))?$/i.test(text(removes[0]) || removes[0].title) ? removes[0] : null;
         }
-        case 'confirm': return buttons.find(el => el.closest('.modal, [role="dialog"]') && /^delete(?: (?:item|listing))?$/i.test(text(el)));
+        case 'confirm': {
+            if (context.oldestId && !oldestRow()) return null;
+            const confirms = buttons.filter(el => el.matches('button.btn-primary') &&
+                el.closest('.modal, dialog, [role="dialog"]') && /^delete$/i.test(text(el)));
+            return confirms.length === 1 ? confirms[0] : null;
+        }
         case 'done': return buttons.find(el => /^done\b/i.test(text(el)));
         case 'list': return buttons.find(el => /^list item$/i.test(text(el)));
         case 'dismiss': {
@@ -217,29 +233,29 @@ async function waitWithPopups(page, predicate, args, timeoutMs) {
     throw error;
 }
 
-async function waitForControl(page, action, timeoutMs = page.getDefaultTimeout()) {
+async function waitForControl(page, action, timeoutMs = page.getDefaultTimeout(), context = {}) {
     try {
-        return await waitWithPopups(page, findControl, [action], timeoutMs);
+        return await waitWithPopups(page, findControl, [action, context], timeoutMs);
     } catch (error) {
         if (error.name !== 'TimeoutError') throw error;
         const labels = { sort: 'Created sort dropdown', sorted: 'Created: Oldest sort result',
-            oldest: 'Oldest option in the sort menu', 'listing-actions': 'unambiguous listing action menu with a Delete entry',
-            trash: 'Delete action in the listing menu', confirm: 'Delete confirmation',
+            oldest: 'Oldest option in the sort menu', 'row-remove': 'one enabled Delete (tool-remove) button in the verified oldest On Sale row',
+            confirm: 'unambiguous Delete confirmation for the verified oldest On Sale row',
             done: 'Done control in the draft editor', list: 'List Item control in the preview' };
         throw new Error(`Timed out waiting for ${labels[action] || action} on ${new URL(page.url()).pathname}.`);
     }
 }
 
-async function clickControl(page, action, options) {
+async function clickControl(page, action, { context = {}, ...options } = {}) {
     const timeout = page.getDefaultTimeout();
     const deadline = timeout ? Date.now() + timeout : Infinity;
     do {
-        const ready = await waitForControl(page, action, Math.max(1, deadline - Date.now()));
+        const ready = await waitForControl(page, action, Math.max(1, deadline - Date.now()), context);
         await ready.dispose();
         await paceAction(page);
         if (await dismissPopup(page)) continue;
         // A popup or the action pause may have caused a render. Resolve again.
-        const handle = await page.evaluateHandle(findControl, action);
+        const handle = await page.evaluateHandle(findControl, action, context);
         try {
             if (handle.asElement()) {
                 await clickElement(page, handle.asElement(), { ...options, paced: true });
@@ -413,12 +429,10 @@ async function deleteOldestListing(page, log, publishedId) {
     const oldestId = listingId(oldest);
     if (oldestId === publishedId) throw new Error('Only the newly posted listing was found; it will not be deleted.');
 
-    await navigate(page, oldest);
-    if (listingId(page.url()) !== oldestId) throw new Error('Unexpected listing opened; deletion stopped.');
-    await dismissPopup(page);
-    await clickControl(page, 'listing-actions');
-    await clickControl(page, 'trash');
-    await clickControl(page, 'confirm');
+    const context = { oldestId, publishedId };
+    log(`Deleting oldest On Sale row: ${oldestId} (Delete/tool-remove).`);
+    await clickControl(page, 'row-remove', { context });
+    await clickControl(page, 'confirm', { context });
     await settle(page);
 
     // A confirmation click is not proof the server accepted the deletion.

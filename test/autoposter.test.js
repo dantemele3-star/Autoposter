@@ -83,6 +83,9 @@ beforeEach(async () => {
                 state.afterPost?.();
             }
             body = '{}';
+        } else if (url.pathname === '/fixture/delist') {
+            state.delisted = (state.delisted || 0) + 1;
+            body = '{}';
         } else if (url.pathname === '/fixture/delete') {
             const id = url.searchParams.get('id');
             state.deleted.push(id);
@@ -206,35 +209,32 @@ function fixture(url) {
         content = `${state.saleListButton ? '<button>List Item</button>' : ''}<div class="dropdown" id="sort">
             <button class="dropdown-toggle" onclick="this.parentElement.classList.toggle('open')">Created: Newest</button>
             <div class="dropdown-menu">${state.sortBroken ? '' : `<button onclick="sortOldest()">Oldest</button>`}</div>
-        </div><div id="rows">${links(saleIds)}</div>
+        </div><div id="rows">${saleIds.map(saleRow).join('')}</div>
+        <div id="delete-confirmation" class="modal" role="dialog" style="display:none">
+            <p>Delete this listing?</p><button class="btn btn-primary" onclick="confirmRemoval()">Delete</button>
+        </div>
         <script>
+            const saleRows = ${JSON.stringify(Object.fromEntries([...new Set([...saleIds, ...state.listings])].map(id => [id, saleRow(id)])))};
+            function openRemoval(id) {
+                const dialog = document.querySelector('#delete-confirmation');
+                dialog.dataset.listingId = id;
+                dialog.style.display = 'block';
+            }
+            function confirmRemoval() {
+                const id = document.querySelector('#delete-confirmation').dataset.listingId;
+                fetch('/fixture/delete?id=' + id).then(() => location.href='/listings/onsale');
+            }
             async function sortOldest() {
                 document.querySelector('#sort button').textContent = 'Created: Oldest';
                 document.querySelector('#sort').classList.remove('open');
                 const ids = await fetch('/fixture/sorted').then(r => r.json());
-                document.querySelector('#rows').innerHTML = ids.map(id =>
-                    '<a href="/item/example/' + id + '">Listing ' + id + '</a>').join('');
+                document.querySelector('#rows').innerHTML = ids.map(id => saleRows[id]).join('');
             }
         </script>`;
         if (state.salePopup) content += notificationPrompt("fetch('/fixture/decline'); this.closest('.notification-prompt').remove()");
         if (state.backgroundOnSaleTraffic) content += backgroundPolling;
     } else if (id) {
-        const icon = state.actionIcon === 'svg' ? '<svg width="16" height="16" aria-hidden="true"><circle cx="8" cy="8" r="2" /></svg>'
-            : `<i class="${state.actionIcon || 'fa-ellipsis-h'}" aria-hidden="true"></i>`;
-        const menu = `<div id="listing-actions-menu" class="dropdown-menu" role="menu">
-            <a role="menuitem" href="#" ${state.titleOnlyDelete ? 'title="Delete listing"' : ''}
-                onclick="event.preventDefault(); document.querySelector('.modal').style.display='block'">
-                ${state.textOnlyDelete ? '' : '<span class="fa-trash"></span>'}${state.titleOnlyDelete ? '' : 'Delete listing'}</a></div>`;
-        const toggle = `onclick="document.querySelector('#listing-actions-menu').style.display='block'"`;
-        const tag = state.spanToggle ? 'span' : 'button';
-        content = `${state.portalMenu ? `<button aria-controls="listing-actions-menu" aria-haspopup="menu" aria-label="Listing actions" ${toggle}>${icon}</button>${menu}`
-            : `<div class="dropdown" id="actions"><${tag} class="dropdown-toggle" aria-label="Listing actions" ${toggle}>${icon}</${tag}>${menu}</div>`}
-        <div class="dropdown" id="account-outside-header">
-            <button onclick="window.wrongMenu=true"><i class="fa-power-off"></i>Account</button>
-            <div class="dropdown-menu"><a href="/logout">Log out</a><button>Delete</button></div>
-        </div><div class="modal" role="dialog" style="display:none">
-            <button class="btn-primary" onclick="fetch('/fixture/delete?id=${id}').then(() => location.href='/listings/onsale')">Delete</button>
-        </div>`;
+        content = `<p>Public item ${id}: no On Sale row controls here.</p>`;
     }
     return `<!doctype html><style>
         body {min-height:600px} .dropdown-menu{display:none}.open>.dropdown-menu{display:block}
@@ -246,8 +246,14 @@ function fixture(url) {
         </div></div></header><nav><a href="/listings/draft">Drafts</a><a href="/listings/sold">Sold</a></nav>
         <div class="listings-container">${content}</div>`;
 }
-function links(ids) {
-    return ids.map(id => `<a target="_blank" href="${itemUrl(id)}">Listing ${id}</a>`).join('');
+// The two buttons below use the exact classes/labels supplied from Gameflip.
+// Row wrappers are deliberately generic: production resolves ownership by ID.
+function saleRow(id) {
+    return `<div class="sale-row" data-listing-id="${id}"><div><a target="_blank" href="${itemUrl(id)}">Listing ${id}</a></div>
+        <div class="tools"><button class="btn btn-outline-secondary tool-btn tool-delist" aria-label="Take off Sale" data-bs-original-title="Take off Sale"
+            onclick="fetch('/fixture/delist?id=${id}')"><span class="fa fa-power-off" aria-hidden="true"></span></button>
+        <button class="btn btn-outline-secondary tool-btn tool-remove" title="Delete" aria-label="Delete"
+            onclick="openRemoval('${id}')"><span class="fa fa-trash" aria-hidden="true"></span></button></div></div>`;
 }
 
 function notificationPrompt(decline, custom = false) {
@@ -307,74 +313,144 @@ test('oldest deletion ignores navigation/profile menus and waits for sorted rows
     assert.deepEqual(state.listings, [NEW, RECENT]);
     assert.equal(state.visits.includes('/listings/sold'), false);
     assert.equal(state.visits.includes('/listings/draft'), false);
+    assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
+    assert.equal(state.delisted || 0, 0);
     assert.equal((await browser.pages()).length, tabs);
     assert.match(logs.at(-1), /deletion verified/);
     assert.equal(await page.$eval('#profile', el => el.matches(':hover')), false);
 });
 
-for (const actionIcon of ['fa-power-off', 'fa-ellipsis-v', 'fa-cog', 'svg']) {
-    test(`oldest deletion uses the seller menu with ${actionIcon} controls rather than the account power icon`, async () => {
-        state.actionIcon = actionIcon;
-        state.textOnlyDelete = true;
-        state.listings.unshift(NEW);
-        await controls.deleteOldestListing(page, () => {}, NEW);
-        assert.deepEqual(state.deleted, [OLD]);
-        assert.deepEqual(state.listings, [NEW, RECENT]);
-        assert.equal(state.visits.includes('/logout'), false);
-    });
-}
-
-test('oldest deletion follows an explicitly associated menu outside the dropdown container', async () => {
-    state.portalMenu = true;
-    state.actionIcon = 'svg';
-    state.textOnlyDelete = true;
+test('On Sale deletion uses the oldest row trash button, never delist or an item page', async () => {
     state.listings.unshift(NEW);
     await controls.deleteOldestListing(page, () => {}, NEW);
     assert.deepEqual(state.deleted, [OLD]);
-    assert.equal(state.visits.includes('/logout'), false);
+    assert.deepEqual(state.listings, [NEW, RECENT]);
+    assert.equal(state.delisted || 0, 0);
+    assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
 });
 
-test('oldest deletion accepts a non-button dropdown toggle and an icon-only Delete entry with a title', async () => {
-    state.spanToggle = true;
-    state.titleOnlyDelete = true;
-    state.actionIcon = 'svg';
-    state.listings.unshift(NEW);
-    await controls.deleteOldestListing(page, () => {}, NEW);
-    assert.deepEqual(state.deleted, [OLD]);
-});
-
-test('missing, disabled, hidden and ambiguous seller controls cannot select a profile or other Delete menu', async () => {
-    await controls.navigate(page, itemUrl(OLD));
+test('row removal rejects missing, disabled, hidden, ambiguous and foreign controls', async () => {
+    await controls.navigate(page, 'https://gameflip.com/listings/onsale');
     await page.evaluate(() => {
-        window.originalActions = document.querySelector('#actions').outerHTML;
-        document.querySelector('#actions').remove();
-        document.querySelector('#account-outside-header .dropdown-menu').style.display = 'block';
+        document.querySelector('#sort button').textContent = 'Created: Oldest';
+        document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
+        window.originalRows = document.querySelector('#rows').innerHTML;
+        document.querySelector('header').insertAdjacentHTML('beforeend', '<button class="tool-remove" aria-label="Delete">Delete</button>');
     });
-    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
-    assert.equal(await page.evaluate(controls.findControl, 'trash'), null);
-    await page.evaluate(() => {
-        document.querySelector('.listings-container').insertAdjacentHTML('afterbegin', window.originalActions);
-        document.querySelector('#actions > button').disabled = true;
-    });
-    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
-    await page.evaluate(() => {
-        document.querySelector('#actions > button').disabled = false;
-        document.querySelector('#actions > button').style.display = 'none';
-    });
-    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
-    await page.evaluate(() => {
-        document.querySelector('#actions > button').style.display = '';
-        document.querySelector('#actions [role="menuitem"]').setAttribute('aria-disabled', 'true');
-    });
-    assert.equal(await page.evaluate(controls.findControl, 'listing-actions'), null);
-    await page.evaluate(() => {
-        document.querySelector('#actions [role="menuitem"]').removeAttribute('aria-disabled');
-        document.querySelector('.listings-container').insertAdjacentHTML('beforeend',
-            '<div class="dropdown"><button>Other actions</button><div class="dropdown-menu"><button>Delete</button></div></div>');
-    });
-    await assert.rejects(controls.clickControl(page, 'listing-actions'), /unambiguous listing action menu/);
+    const context = { oldestId: OLD, publishedId: NEW };
+    const noTarget = async () => assert.equal(await page.evaluate(controls.findControl, 'row-remove', context), null);
+    for (const change of ['missing', 'disabled', 'aria-disabled', 'hidden', 'ambiguous', 'duplicate row', 'removed row', 'unsorted', 'conflicting ID']) {
+        await page.evaluate(change => {
+            const root = document.querySelector('#rows');
+            root.innerHTML = window.originalRows;
+            const row = root.querySelector('.sale-row');
+            const remove = row.querySelector('.tool-remove');
+            switch (change) {
+                case 'missing': remove.remove(); break;
+                case 'disabled': remove.disabled = true; break;
+                case 'aria-disabled': remove.setAttribute('aria-disabled', 'true'); break;
+                case 'hidden': remove.style.display = 'none'; break;
+                case 'ambiguous': row.querySelector('.tools').append(remove.cloneNode(true)); break;
+                case 'duplicate row': root.append(row.cloneNode(true)); break;
+                case 'removed row': row.remove(); break;
+                case 'unsorted': document.querySelector('#sort button').textContent = 'Created: Newest'; break;
+                case 'conflicting ID': row.dataset.listingId = '33333333-3333-4333-8333-333333333333'; break;
+            }
+        }, change);
+        await noTarget();
+        await page.evaluate(() => { document.querySelector('#sort button').textContent = 'Created: Oldest'; });
+    }
     assert.deepEqual(state.deleted, []);
-    assert.equal(await page.evaluate(() => !!window.wrongMenu), false);
+    assert.equal(state.delisted || 0, 0);
+});
+
+test('a Take off Sale button alone never substitutes for Delete', async () => {
+    const goto = page.goto.bind(page);
+    page.goto = async (...args) => {
+        const response = await goto(...args);
+        await page.evaluate(() => {
+            document.querySelectorAll('.tool-remove').forEach(el => el.remove());
+            window.sortOldest = async () => {
+                document.querySelector('#sort button').textContent = 'Created: Oldest';
+                document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
+            };
+        });
+        return response;
+    };
+    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /Delete \(tool-remove\) button/);
+    assert.deepEqual(state.deleted, []);
+    assert.equal(state.delisted || 0, 0);
+    assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
+});
+
+test('On Sale Delete and confirmation clicks retain the two-second action spacing', async () => {
+    await controls.navigate(page, 'https://gameflip.com/listings/onsale');
+    await page.evaluate(() => {
+        document.querySelector('#sort button').textContent = 'Created: Oldest';
+        document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
+        window.confirmRemoval = () => {};
+        window.clickTimes = [];
+        document.addEventListener('click', event => {
+            if (event.target.closest('.tool-remove, #delete-confirmation button')) window.clickTimes.push(performance.now());
+        });
+    });
+    setPagePacer(page);
+    const context = { oldestId: OLD, publishedId: NEW };
+    await controls.clickControl(page, 'row-remove', { context });
+    await controls.clickControl(page, 'confirm', { context });
+    const times = await page.evaluate(() => window.clickTimes);
+    assert.equal(times.length, 2);
+    assert.ok(times[1] - times[0] >= 1990, 'Row deletion clicks were not paced by two seconds');
+});
+
+test('removal resolves the listing ID again after rows rerender during the action pause', async () => {
+    state.listings.unshift(NEW);
+    let clock = 0;
+    setPagePacer(page, new ActionPacer({ now: () => clock, sleep: async ms => {
+        clock += ms;
+        await page.evaluate(() => {
+            if (document.querySelector('#rows')) document.querySelector('#rows').innerHTML = document.querySelector('#rows').innerHTML;
+        });
+    } }));
+    await controls.deleteOldestListing(page, () => {}, NEW);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.equal(state.delisted || 0, 0);
+});
+
+test('a row replacement during the action pause cannot delete the new oldest or protected listing', async () => {
+    await controls.navigate(page, 'https://gameflip.com/listings/onsale');
+    await page.evaluate(() => {
+        document.querySelector('#sort button').textContent = 'Created: Oldest';
+        document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
+    });
+    let clock = 0;
+    setPagePacer(page, new ActionPacer({ now: () => clock, sleep: async ms => {
+        clock += ms;
+        await page.evaluate(() => { document.querySelector('.sale-row').remove(); });
+    } }));
+    await assert.rejects(controls.clickControl(page, 'row-remove', { context: { oldestId: OLD, publishedId: NEW } }), /verified oldest On Sale row/);
+    assert.deepEqual(state.deleted, []);
+    assert.equal(state.delisted || 0, 0);
+});
+
+test('removal cannot confirm an ambiguous Delete dialog or a changed oldest row', async () => {
+    await controls.navigate(page, 'https://gameflip.com/listings/onsale');
+    await page.evaluate(() => {
+        document.querySelector('#sort button').textContent = 'Created: Oldest';
+        document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
+    });
+    const context = { oldestId: OLD, publishedId: NEW };
+    await controls.clickControl(page, 'row-remove', { context });
+    await page.evaluate(() => {
+        document.body.insertAdjacentHTML('beforeend', '<div role="dialog"><button class="btn btn-primary">Delete</button></div>');
+    });
+    assert.equal(await page.evaluate(controls.findControl, 'confirm', context), null);
+    await page.evaluate(() => {
+        document.querySelector('[role="dialog"]:not(#delete-confirmation)').remove();
+        document.querySelector('.sale-row').remove();
+    });
+    assert.equal(await page.evaluate(controls.findControl, 'confirm', context), null);
+    assert.deepEqual(state.deleted, []);
 });
 
 const sourceId = n => `${n.toString(16).padStart(8, '0')}-0000-4000-8000-000000000000`;
@@ -620,8 +696,6 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     const first = 0x60000000;
     state.draftPages = [sourceIds(first, 50), sourceIds(first + 50, 50), sourceIds(first + 100, 5)];
     state.pager = 'none';
-    state.actionIcon = 'svg';
-    state.textOnlyDelete = true;
     state.backgroundDraftTraffic = true;
     state.facebookTracking = true;
     state.postPopup = 'inline';

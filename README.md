@@ -112,12 +112,13 @@ local and are excluded from Git.
 ## Maintain listing count
 
 With **Delete Oldest Listing** checked, the app verifies that the new listing was
-published, opens On Sale, selects **Created: Oldest**, and opens the oldest
-individual listing. It uses that listing's action menu and confirmation dialog,
-then refreshes On Sale to check that the listing disappeared. The menu is
-identified by its own **Delete** entry rather than its icon, and must have one
-identifiable toggle outside navigation, profile, and logout menus. Ambiguous or
-unavailable controls pause the run without deleting anything. It never falls
+published, opens On Sale, and selects **Created: Oldest**. It stays on that page
+and clicks the oldest listing row's **Delete** trash button (`tool-remove`), then
+the Delete confirmation. The power button (`tool-delist`, **Take off Sale**) is
+not deletion and is never used as a fallback. The app refreshes On Sale to verify
+that the listing disappeared. It rechecks the sorted row's listing ID after
+action pauses and popup handling; missing, changed, or ambiguous controls pause
+the run without guessing another target. It never falls
 back to deleting the first unsorted item and does not delete the newly posted
 listing when it is the only one available.
 
@@ -191,8 +192,8 @@ profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.
 
 Regression coverage also checks asynchronous main-process clipboard writes and failures,
-menu ownership with different icons and text-only Delete entries, rejection of
-ambiguous/account menus, and a full 105-draft scan through publication and count
+row-scoped Delete controls distinct from Take off Sale, rejection of changed
+rows and ambiguous controls/confirmations, and a full 105-draft scan through publication and count
 maintenance, including background polling from the first Drafts navigation,
 delayed row batches, unfinished loading indicators, and delayed listing-data
 responses.
