@@ -29,8 +29,14 @@ before(async () => {
 });
 after(async () => browser?.close());
 beforeEach(async () => {
-    state = { listings: [RECENT, OLD], visits: [], requests: [], deleted: [], published: [], posts: 0, drafts: 1 };
+    state = { listings: [RECENT, OLD], visits: [], requests: [], deleted: [], published: [], posts: 0, drafts: 1, offSale: [], delistedIds: [] };
     page = await browser.newPage();
+    state.cacheEnabled = true;
+    const setCacheEnabled = page.setCacheEnabled.bind(page);
+    page.setCacheEnabled = async enabled => {
+        state.cacheEnabled = enabled;
+        return setCacheEnabled(enabled);
+    };
     let actionClock = 0;
     setPagePacer(page, new ActionPacer({ now: () => actionClock, sleep: async ms => { actionClock += ms; } }));
     const setPageTimeout = page.setDefaultTimeout.bind(page);
@@ -84,12 +90,21 @@ beforeEach(async () => {
             }
             body = '{}';
         } else if (url.pathname === '/fixture/delist') {
+            const id = url.searchParams.get('id');
             state.delisted = (state.delisted || 0) + 1;
-            body = '{}';
+            state.delistedIds.push(id);
+            if (!state.rejectDelist) {
+                state.listings = state.listings.filter(value => value !== id);
+                state.offSale.push(id);
+            }
+            body = JSON.stringify({ success: !state.rejectDelist });
         } else if (url.pathname === '/fixture/delete') {
             const id = url.searchParams.get('id');
             state.deleted.push(id);
-            if (!state.rejectDelete) state.listings = state.listings.filter(value => value !== id);
+            if (!state.rejectDelete) {
+                state.listings = state.listings.filter(value => value !== id);
+                state.offSale = state.offSale.filter(value => value !== id);
+            }
             body = '{}';
         } else if (url.pathname === '/fixture/decline' || url.pathname === '/fixture/accept') {
             const key = url.pathname.endsWith('/decline') ? 'declines' : 'accepts';
@@ -129,11 +144,16 @@ function fixture(url) {
     const backgroundPolling = '<script>fetch("/fixture/background").catch(() => {}); setInterval(() => fetch("/fixture/background").catch(() => {}), 100)</script>';
     let content = '';
     if (url.pathname === '/listings/draft') {
-        const pages = state.draftPages || [[NEW, NEXT].slice(0, state.drafts)];
+        const pages = (state.draftPages || [[NEW, NEXT].slice(0, state.drafts)]).map(ids => [...ids]);
+        const offSale = state.staleDraftCache && state.cacheEnabled ? [] : state.offSale;
+        for (const id of offSale) {
+            if (pages.at(-1).length >= 50) pages.push([]);
+            pages.at(-1).push(id);
+        }
         const number = state.ignorePage ? 1 : Number(url.searchParams.get('page') || 1);
         const ids = pages[number - 1] || [];
         if (!ids.length && !state.blankDraftPage) content += '<p class="empty-state">No drafts found.</p>';
-        content += ids.map(id => state.copyWrapper
+        content += ids.map(id => state.offSale.includes(id) ? saleRow(id, true) : state.copyWrapper
             ? `<div data-listing-id="${id}"><a href="/item/source/${id}">Source draft</a>
                 <span class="tool-duplicate"><button onpointerdown="window.pressed=true"
                     onclick="if(window.pressed) location.href='/listings/${id}/edit'">Copy</button></span></div>`
@@ -209,20 +229,14 @@ function fixture(url) {
         content = `${state.saleListButton ? '<button>List Item</button>' : ''}<div class="dropdown" id="sort">
             <button class="dropdown-toggle" onclick="this.parentElement.classList.toggle('open')">Created: Newest</button>
             <div class="dropdown-menu">${state.sortBroken ? '' : `<button onclick="sortOldest()">Oldest</button>`}</div>
-        </div><div id="rows">${saleIds.map(saleRow).join('')}</div>
-        <div id="delete-confirmation" class="modal" role="dialog" style="display:none">
-            <p>Delete this listing?</p><button class="btn btn-primary" onclick="confirmRemoval()">Delete</button>
-        </div>
+        </div><div id="rows">${saleIds.map(id => saleRow(id)).join('')}</div>
         <script>
             const saleRows = ${JSON.stringify(Object.fromEntries([...new Set([...saleIds, ...state.listings])].map(id => [id, saleRow(id)])))};
-            function openRemoval(id) {
-                const dialog = document.querySelector('#delete-confirmation');
-                dialog.dataset.listingId = id;
-                dialog.style.display = 'block';
-            }
-            function confirmRemoval() {
-                const id = document.querySelector('#delete-confirmation').dataset.listingId;
-                fetch('/fixture/delete?id=' + id).then(() => location.href='/listings/onsale');
+            async function delistRow(id) {
+                const result = await fetch('/fixture/delist?id=' + id).then(r => r.json());
+                if (!result.success) return;
+                const row = document.querySelector('.sale-row[data-listing-id="' + id + '"]');
+                ${state.moveDelisted ? 'row.remove();' : "row.querySelector('.tool-delist').remove(); row.querySelector('.tool-remove').style.display = '';"}
             }
             async function sortOldest() {
                 document.querySelector('#sort button').textContent = 'Created: Oldest';
@@ -244,15 +258,29 @@ function fixture(url) {
         <div class="dropdown-menu"><a href="/listings/sold">Sold</a><a href="/listings/draft">Drafts</a>
             <button><span class="fa-power-off">Log out</span></button><button><span class="fa-trash">Wrong delete</span></button>
         </div></div></header><nav><a href="/listings/draft">Drafts</a><a href="/listings/sold">Sold</a></nav>
-        <div class="listings-container">${content}</div>`;
+        <div class="listings-container">${content}</div>
+        <div id="delete-confirmation" class="modal" role="dialog" style="display:none">
+            <p>Delete this listing?</p><button class="btn btn-primary" onclick="confirmRemoval()">Delete</button>
+        </div><script>
+            function openRemoval(id) {
+                const dialog = document.querySelector('#delete-confirmation');
+                dialog.dataset.listingId = id;
+                dialog.style.display = 'block';
+            }
+            function confirmRemoval() {
+                const id = document.querySelector('#delete-confirmation').dataset.listingId;
+                fetch('/fixture/delete?id=' + id).then(() => location.href='/listings/onsale');
+            }
+        </script>`;
 }
 // The two buttons below use the exact classes/labels supplied from Gameflip.
 // Row wrappers are deliberately generic: production resolves ownership by ID.
-function saleRow(id) {
+function saleRow(id, offSale = false) {
     return `<div class="sale-row" data-listing-id="${id}"><div><a target="_blank" href="${itemUrl(id)}">Listing ${id}</a></div>
-        <div class="tools"><button class="btn btn-outline-secondary tool-btn tool-delist" aria-label="Take off Sale" data-bs-original-title="Take off Sale"
-            onclick="fetch('/fixture/delist?id=${id}')"><span class="fa fa-power-off" aria-hidden="true"></span></button>
-        <button class="btn btn-outline-secondary tool-btn tool-remove" title="Delete" aria-label="Delete"
+        <div class="tools"><a class="tool-duplicate" href="/listings/${id}/copy">Copy</a>
+        ${offSale ? '' : `<button class="btn btn-outline-secondary tool-btn tool-delist" aria-label="Take off Sale" data-bs-original-title="Take off Sale"
+            onclick="delistRow('${id}')"><span class="fa fa-power-off" aria-hidden="true"></span></button>`}
+        <button style="${offSale ? '' : 'display:none'}" class="btn btn-outline-secondary tool-btn tool-remove" title="Delete" aria-label="Delete"
             onclick="openRemoval('${id}')"><span class="fa fa-trash" aria-hidden="true"></span></button></div></div>`;
 }
 
@@ -312,78 +340,116 @@ test('oldest deletion ignores navigation/profile menus and waits for sorted rows
     assert.deepEqual(state.deleted, [OLD]);
     assert.deepEqual(state.listings, [NEW, RECENT]);
     assert.equal(state.visits.includes('/listings/sold'), false);
-    assert.equal(state.visits.includes('/listings/draft'), false);
     assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
-    assert.equal(state.delisted || 0, 0);
+    assert.equal(state.delisted || 0, 1);
+    assert.deepEqual(state.delistedIds, [OLD]);
     assert.equal((await browser.pages()).length, tabs);
     assert.match(logs.at(-1), /deletion verified/);
     assert.equal(await page.$eval('#profile', el => el.matches(':hover')), false);
 });
 
-test('On Sale deletion uses the oldest row trash button, never delist or an item page', async () => {
+test('On Sale maintenance takes off sale, deletes, and confirms only the oldest ID', async () => {
     state.listings.unshift(NEW);
     await controls.deleteOldestListing(page, () => {}, NEW);
     assert.deepEqual(state.deleted, [OLD]);
     assert.deepEqual(state.listings, [NEW, RECENT]);
-    assert.equal(state.delisted || 0, 0);
+    assert.equal(state.delisted || 0, 1);
+    assert.deepEqual(state.delistedIds, [OLD]);
     assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
 });
 
-test('row removal rejects missing, disabled, hidden, ambiguous and foreign controls', async () => {
-    await controls.navigate(page, 'https://gameflip.com/listings/onsale');
-    await page.evaluate(() => {
-        document.querySelector('#sort button').textContent = 'Created: Oldest';
-        document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
-        window.originalRows = document.querySelector('#rows').innerHTML;
-        document.querySelector('header').insertAdjacentHTML('beforeend', '<button class="tool-remove" aria-label="Delete">Delete</button>');
-    });
-    const context = { oldestId: OLD, publishedId: NEW };
-    const noTarget = async () => assert.equal(await page.evaluate(controls.findControl, 'row-remove', context), null);
-    for (const change of ['missing', 'disabled', 'aria-disabled', 'hidden', 'ambiguous', 'duplicate row', 'removed row', 'unsorted', 'conflicting ID']) {
-        await page.evaluate(change => {
-            const root = document.querySelector('#rows');
-            root.innerHTML = window.originalRows;
-            const row = root.querySelector('.sale-row');
-            const remove = row.querySelector('.tool-remove');
-            switch (change) {
-                case 'missing': remove.remove(); break;
-                case 'disabled': remove.disabled = true; break;
-                case 'aria-disabled': remove.setAttribute('aria-disabled', 'true'); break;
-                case 'hidden': remove.style.display = 'none'; break;
-                case 'ambiguous': row.querySelector('.tools').append(remove.cloneNode(true)); break;
-                case 'duplicate row': root.append(row.cloneNode(true)); break;
-                case 'removed row': row.remove(); break;
-                case 'unsorted': document.querySelector('#sort button').textContent = 'Created: Newest'; break;
-                case 'conflicting ID': row.dataset.listingId = '33333333-3333-4333-8333-333333333333'; break;
-            }
-        }, change);
-        await noTarget();
-        await page.evaluate(() => { document.querySelector('#sort button').textContent = 'Created: Oldest'; });
-    }
-    assert.deepEqual(state.deleted, []);
-    assert.equal(state.delisted || 0, 0);
+test('title and toolbar Copy links for the same listing resolve to one Delete button', async () => {
+    state.listings.unshift(NEW);
+    const logs = [];
+    await controls.deleteOldestListing(page, message => logs.push(message), NEW);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.equal(state.delisted || 0, 1);
+    assert.deepEqual(state.delistedIds, [OLD]);
+    assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
+    const snapshot = JSON.parse(logs.find(message => message.startsWith('On Sale controls: ')).slice('On Sale controls: '.length));
+    assert.equal(snapshot.oldestId, OLD);
+    assert.equal(snapshot.targetLinks, 2);
+    assert.deepEqual(snapshot.remove, { total: 3, visible: 0, enabled: 0 });
+    assert.deepEqual(snapshot.copy, { total: 3, visible: 3, enabled: 3 });
 });
 
-test('a Take off Sale button alone never substitutes for Delete', async () => {
-    const goto = page.goto.bind(page);
-    page.goto = async (...args) => {
-        const response = await goto(...args);
+for (const action of ['row-delist', 'row-remove']) {
+    test(`${action} rejects missing, disabled, hidden, ambiguous and foreign controls`, async () => {
+        const selector = action === 'row-delist' ? '.tool-delist' : '.tool-remove';
+        await controls.navigate(page, 'https://gameflip.com/listings/onsale');
         await page.evaluate(() => {
-            document.querySelectorAll('.tool-remove').forEach(el => el.remove());
-            window.sortOldest = async () => {
-                document.querySelector('#sort button').textContent = 'Created: Oldest';
-                document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
-            };
+            document.querySelector('#sort button').textContent = 'Created: Oldest';
+            document.querySelectorAll('.tool-remove').forEach(el => { el.style.display = ''; });
+            document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
+            window.originalRows = document.querySelector('#rows').innerHTML;
+            document.querySelector('header').insertAdjacentHTML('beforeend', '<button class="tool-remove" aria-label="Delete">Delete</button>');
         });
-        return response;
-    };
-    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /Delete \(tool-remove\) button/);
+        const context = { oldestId: OLD, publishedId: NEW };
+        const noTarget = async () => assert.equal(await page.evaluate(controls.findControl, action, context), null);
+        for (const change of ['missing', 'disabled', 'aria-disabled', 'hidden', 'ambiguous', 'duplicate row', 'removed row', 'unsorted', 'conflicting ID']) {
+            await page.evaluate(({ change, selector }) => {
+                const root = document.querySelector('#rows');
+                root.innerHTML = window.originalRows;
+                const row = root.querySelector('.sale-row');
+                const remove = row.querySelector(selector);
+                switch (change) {
+                    case 'missing': remove.remove(); break;
+                    case 'disabled': remove.disabled = true; break;
+                    case 'aria-disabled': remove.setAttribute('aria-disabled', 'true'); break;
+                    case 'hidden': remove.style.display = 'none'; break;
+                    case 'ambiguous': row.querySelector('.tools').append(remove.cloneNode(true)); break;
+                    case 'duplicate row': root.append(row.cloneNode(true)); break;
+                    case 'removed row': row.remove(); break;
+                    case 'unsorted': document.querySelector('#sort button').textContent = 'Created: Newest'; break;
+                    case 'conflicting ID': row.dataset.listingId = '33333333-3333-4333-8333-333333333333'; break;
+                }
+            }, { change, selector });
+            await noTarget();
+            await page.evaluate(() => { document.querySelector('#sort button').textContent = 'Created: Oldest'; });
+        }
+        assert.deepEqual(state.deleted, []);
+        assert.equal(state.delisted || 0, 0);
+    });
+}
+
+test('failed Take off Sale stops without pressing Delete or selecting another row', async () => {
+    state.rejectDelist = true;
+    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /delisted listing could not be located by ID/);
     assert.deepEqual(state.deleted, []);
-    assert.equal(state.delisted || 0, 0);
-    assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
+    assert.deepEqual(state.delistedIds, [OLD]);
+    assert.deepEqual(state.listings, [RECENT, OLD]);
 });
 
-test('On Sale Delete and confirmation clicks retain the two-second action spacing', async () => {
+test('a delisted listing moved to a later Drafts page is found by ID and fully deleted', async () => {
+    state.moveDelisted = true;
+    state.draftPages = [sourceIds(0x76000000, 50), sourceIds(0x76000032, 50), sourceIds(0x76000064, 5)];
+    state.listings.unshift(NEW);
+    await controls.deleteOldestListing(page, () => {}, NEW);
+    assert.deepEqual(state.delistedIds, [OLD]);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.deepEqual(state.offSale, []);
+    assert.deepEqual(state.listings, [NEW, RECENT]);
+    assert.equal(state.cacheEnabled, true);
+});
+
+test('fresh Drafts reads detect a failed Delete despite a stale pre-delist cache', async () => {
+    state.moveDelisted = true;
+    state.rejectDelete = true;
+    state.staleDraftCache = true;
+    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /still saved in Drafts/);
+    assert.deepEqual(state.delistedIds, [OLD]);
+    assert.deepEqual(state.offSale, [OLD]);
+    assert.equal(state.cacheEnabled, true);
+});
+
+test('a reordered repeated Drafts page cannot prove the deleted ID is absent', async () => {
+    const ids = sourceIds(0x77000000, 50);
+    state.draftPages = [ids, [...ids].reverse()];
+    await assert.rejects(drafts.findDraft(page, OLD), /only already scanned drafts/);
+    assert.equal(state.cacheEnabled, true);
+});
+
+test('Take off Sale, row Delete and final confirmation retain two-second action spacing', async () => {
     await controls.navigate(page, 'https://gameflip.com/listings/onsale');
     await page.evaluate(() => {
         document.querySelector('#sort button').textContent = 'Created: Oldest';
@@ -391,16 +457,17 @@ test('On Sale Delete and confirmation clicks retain the two-second action spacin
         window.confirmRemoval = () => {};
         window.clickTimes = [];
         document.addEventListener('click', event => {
-            if (event.target.closest('.tool-remove, #delete-confirmation button')) window.clickTimes.push(performance.now());
+            if (event.target.closest('.tool-delist, .tool-remove, #delete-confirmation button')) window.clickTimes.push(performance.now());
         });
     });
     setPagePacer(page);
     const context = { oldestId: OLD, publishedId: NEW };
+    await controls.clickControl(page, 'row-delist', { context });
     await controls.clickControl(page, 'row-remove', { context });
     await controls.clickControl(page, 'confirm', { context });
     const times = await page.evaluate(() => window.clickTimes);
-    assert.equal(times.length, 2);
-    assert.ok(times[1] - times[0] >= 1990, 'Row deletion clicks were not paced by two seconds');
+    assert.equal(times.length, 3);
+    for (let i = 1; i < times.length; i++) assert.ok(times[i] - times[i - 1] >= 1990, 'Deletion clicks were not paced by two seconds');
 });
 
 test('removal resolves the listing ID again after rows rerender during the action pause', async () => {
@@ -414,13 +481,15 @@ test('removal resolves the listing ID again after rows rerender during the actio
     } }));
     await controls.deleteOldestListing(page, () => {}, NEW);
     assert.deepEqual(state.deleted, [OLD]);
-    assert.equal(state.delisted || 0, 0);
+    assert.equal(state.delisted || 0, 1);
+    assert.deepEqual(state.delistedIds, [OLD]);
 });
 
 test('a row replacement during the action pause cannot delete the new oldest or protected listing', async () => {
     await controls.navigate(page, 'https://gameflip.com/listings/onsale');
     await page.evaluate(() => {
         document.querySelector('#sort button').textContent = 'Created: Oldest';
+        document.querySelectorAll('.tool-remove').forEach(el => { el.style.display = ''; });
         document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
     });
     let clock = 0;
@@ -437,6 +506,7 @@ test('removal cannot confirm an ambiguous Delete dialog or a changed oldest row'
     await controls.navigate(page, 'https://gameflip.com/listings/onsale');
     await page.evaluate(() => {
         document.querySelector('#sort button').textContent = 'Created: Oldest';
+        document.querySelectorAll('.tool-remove').forEach(el => { el.style.display = ''; });
         document.querySelector('#rows').innerHTML = [...document.querySelectorAll('.sale-row')].reverse().map(row => row.outerHTML).join('');
     });
     const context = { oldestId: OLD, publishedId: NEW };
@@ -1173,8 +1243,9 @@ test('current On Sale traffic still blocks deletion instead of guessing sorted r
 
 test('failed server deletion is reported, not counted as successful', async () => {
     state.rejectDelete = true;
-    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /still On Sale/);
-    assert.deepEqual(state.listings, [RECENT, OLD]);
+    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /still saved in Drafts/);
+    assert.deepEqual(state.listings, [RECENT]);
+    assert.deepEqual(state.offSale, [OLD]);
 });
 
 test('the newly published listing is protected when it is the only listing', async () => {
@@ -1227,7 +1298,7 @@ test('maintenance failure stops further posts and retains the confirmed count', 
     assert.equal(result.success, false);
     assert.equal(result.postedCount, 1);
     assert.equal(state.posts, 1);
-    assert.match(result.error, /still On Sale/);
+    assert.match(result.error, /still saved in Drafts/);
 });
 
 test('overlapping runs are rejected and Stop interrupts the rate-limit wait', async () => {

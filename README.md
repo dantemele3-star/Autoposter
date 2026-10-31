@@ -112,15 +112,23 @@ local and are excluded from Git.
 ## Maintain listing count
 
 With **Delete Oldest Listing** checked, the app verifies that the new listing was
-published, opens On Sale, and selects **Created: Oldest**. It stays on that page
-and clicks the oldest listing row's **Delete** trash button (`tool-remove`), then
-the Delete confirmation. The power button (`tool-delist`, **Take off Sale**) is
-not deletion and is never used as a fallback. The app refreshes On Sale to verify
-that the listing disappeared. It rechecks the sorted row's listing ID after
-action pauses and popup handling; missing, changed, or ambiguous controls pause
-the run without guessing another target. It never falls
+published, opens On Sale, and selects **Created: Oldest**. It clicks that row's
+**Take off Sale** power button (`tool-delist`), then its **Delete** trash button
+(`tool-remove`), then the primary **Delete** confirmation. Delete becomes
+available after taking the listing off sale. If the row moves into Drafts, the
+app finds it there by its original listing ID, across all necessary pages.
+It verifies that the ID is absent from both On Sale and saved Drafts; taking
+an item off sale alone is not reported as deletion. It rechecks the target ID
+after action pauses and popup handling; missing, changed, or ambiguous controls
+pause the run without guessing another target. It never falls
 back to deleting the first unsorted item and does not delete the newly posted
 listing when it is the only one available.
+
+Title, image, and Copy links for the same listing are allowed to share one
+Delete button. The log reports visible/enabled Delete, Take off Sale, and Copy
+control counts before deletion and when a deletion control times out. These
+diagnostics contain counts and the target listing ID, without page HTML or
+account data.
 
 If posting, sorting, or deletion cannot be confirmed, the run pauses with an
 error. Check Gameflip before restarting after an uncertain publication, to avoid
@@ -192,7 +200,7 @@ profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.
 
 Regression coverage also checks asynchronous main-process clipboard writes and failures,
-row-scoped Delete controls distinct from Take off Sale, rejection of changed
+the Take off Sale → row Delete → final confirmation sequence, rejection of changed
 rows and ambiguous controls/confirmations, and a full 105-draft scan through publication and count
 maintenance, including background polling from the first Drafts navigation,
 delayed row batches, unfinished loading indicators, and delayed listing-data

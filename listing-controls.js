@@ -97,10 +97,11 @@ function findControl(action, context = {}) {
     const sort = () => buttons.find(el => el.matches('.dropdown-toggle') && /created\s*:/i.test(text(el)));
     const menuFor = el => el?.closest('.dropdown, .btn-group')?.querySelector('.dropdown-menu');
     const enabled = el => !el.disabled && el.getAttribute('aria-disabled') !== 'true';
-    const oldestRow = () => {
-        if (location.origin !== 'https://gameflip.com' || location.pathname !== '/listings/onsale' ||
+    const ownedControl = selector => {
+        const allowedPaths = context.delisted ? ['/listings/onsale', '/listings/draft'] : ['/listings/onsale'];
+        if (location.origin !== 'https://gameflip.com' || !allowedPaths.includes(location.pathname) ||
             !context.oldestId || context.oldestId === context.publishedId ||
-            !/created\s*:\s*oldest/i.test(text(sort() || document.createElement('span')))) return null;
+            (!context.delisted && !/created\s*:\s*oldest/i.test(text(sort() || document.createElement('span'))))) return null;
         const idOf = value => {
             try {
                 const url = new URL(value, location.href);
@@ -116,9 +117,11 @@ function findControl(action, context = {}) {
             !el.closest('.dropdown-menu, [role="menu"], .modal, [role="dialog"]') && idOf(el.href));
         // Recheck sorting and identity after every popup/action pause. A refresh
         // must not turn a saved row position into a different deletion target.
-        if (idOf(links[0]?.href) !== context.oldestId) return null;
-        const rows = new Set();
+        if (!context.delisted && idOf(links[0]?.href) !== context.oldestId) return null;
+        const targets = new Set();
         for (const link of links.filter(el => idOf(el.href) === context.oldestId)) {
+            const owner = link.closest('[data-listing-id]');
+            if (owner && owner.getAttribute('data-listing-id').toLowerCase() !== context.oldestId) return null;
             for (let row = link.parentElement; row && row !== document.body; row = row.parentElement) {
                 const ids = new Set([...row.querySelectorAll('a[href]')].map(el => idOf(el.href)).filter(Boolean));
                 for (const el of [row, ...row.querySelectorAll('[data-listing-id], [data-id]')]) {
@@ -127,10 +130,16 @@ function findControl(action, context = {}) {
                 }
                 // Stop before reaching a container shared with another listing.
                 if (ids.size !== 1 || !ids.has(context.oldestId)) break;
-                if (row.querySelector('button.tool-remove')) { rows.add(row); break; }
+                const controls = [...row.querySelectorAll(selector)];
+                if (controls.length) {
+                    // The title/image and Copy links can reach the same button
+                    // through different containers. Count action controls, not wrappers.
+                    controls.forEach(el => targets.add(el));
+                    break;
+                }
             }
         }
-        return rows.size === 1 ? [...rows][0] : null;
+        return targets.size === 1 ? [...targets][0] : null;
     };
 
     switch (action) {
@@ -141,18 +150,17 @@ function findControl(action, context = {}) {
             return visible(menu) && [...menu.querySelectorAll('a, button, [role="menuitem"]')]
                 .find(el => visible(el) && /\boldest\b/i.test(text(el)));
         }
+        case 'row-delist':
         case 'row-remove': {
-            // Confirmed On Sale markup: tool-delist is "Take off Sale";
-            // tool-remove is "Delete". Never substitute the power/delist icon.
-            const row = oldestRow();
-            if (!row || buttons.some(el => el.closest('.modal, [role="dialog"]') && /^delete(?: (?:item|listing))?$/i.test(text(el)))) return null;
-            const removes = [...row.querySelectorAll('button.tool-remove')];
-            return removes.length === 1 && visible(removes[0]) && content(removes[0]) && enabled(removes[0]) &&
-                !removes[0].closest('.dropdown-menu, [role="menu"]') &&
-                /^delete(?: (?:item|listing))?$/i.test(text(removes[0]) || removes[0].title) ? removes[0] : null;
+            const delist = action === 'row-delist';
+            const remove = ownedControl(delist ? 'button.tool-delist' : 'button.tool-remove');
+            if (!remove || buttons.some(el => el.closest('.modal, dialog, [role="dialog"]') && /^delete(?: (?:item|listing))?$/i.test(text(el)))) return null;
+            return visible(remove) && content(remove) && enabled(remove) &&
+                !remove.closest('.dropdown-menu, [role="menu"]') &&
+                (delist ? /^take off sale$/i : /^delete(?: (?:item|listing))?$/i).test(text(remove) || remove.title) ? remove : null;
         }
         case 'confirm': {
-            if (context.oldestId && !oldestRow()) return null;
+            if (context.oldestId && !ownedControl('button.tool-remove')) return null;
             const confirms = buttons.filter(el => el.matches('button.btn-primary') &&
                 el.closest('.modal, dialog, [role="dialog"]') && /^delete$/i.test(text(el)));
             return confirms.length === 1 ? confirms[0] : null;
@@ -233,16 +241,38 @@ async function waitWithPopups(page, predicate, args, timeoutMs) {
     throw error;
 }
 
+// Report only control counts and the already-logged target ID, never page HTML,
+// account text, URLs, cookies or form values.
+function deletionControlState(context) {
+    const visible = el => el.getClientRects().length > 0 && getComputedStyle(el).visibility !== 'hidden' &&
+        !el.closest('[aria-hidden="true"]');
+    const counts = selector => {
+        const controls = [...document.querySelectorAll(selector)].filter(el => !el.closest('header, nav, .navbar, [role="navigation"]'));
+        return { total: controls.length, visible: controls.filter(visible).length,
+            enabled: controls.filter(el => visible(el) && !el.disabled && el.getAttribute('aria-disabled') !== 'true').length };
+    };
+    return { oldestId: context.oldestId,
+        targetLinks: [...document.querySelectorAll('a[href]')].filter(el => visible(el) && el.href.includes(context.oldestId)).length,
+        remove: counts('button.tool-remove'), delist: counts('button.tool-delist'),
+        copy: counts('.tool-duplicate'), dialogs: counts('.modal, dialog, [role="dialog"]') };
+}
+
 async function waitForControl(page, action, timeoutMs = page.getDefaultTimeout(), context = {}) {
     try {
         return await waitWithPopups(page, findControl, [action, context], timeoutMs);
     } catch (error) {
         if (error.name !== 'TimeoutError') throw error;
         const labels = { sort: 'Created sort dropdown', sorted: 'Created: Oldest sort result',
+            'row-delist': 'one enabled Take off Sale (tool-delist) button in the verified oldest On Sale row',
             oldest: 'Oldest option in the sort menu', 'row-remove': 'one enabled Delete (tool-remove) button in the verified oldest On Sale row',
             confirm: 'unambiguous Delete confirmation for the verified oldest On Sale row',
             done: 'Done control in the draft editor', list: 'List Item control in the preview' };
-        throw new Error(`Timed out waiting for ${labels[action] || action} on ${new URL(page.url()).pathname}.`);
+        let details = '';
+        if (context.oldestId) {
+            try { details = ` On Sale controls: ${JSON.stringify(await page.evaluate(deletionControlState, context))}`; }
+            catch { details = ' On Sale control inspection unavailable.'; }
+        }
+        throw new Error(`Timed out waiting for ${labels[action] || action} on ${new URL(page.url()).pathname}.${details}`);
     }
 }
 
@@ -430,9 +460,27 @@ async function deleteOldestListing(page, log, publishedId) {
     if (oldestId === publishedId) throw new Error('Only the newly posted listing was found; it will not be deleted.');
 
     const context = { oldestId, publishedId };
-    log(`Deleting oldest On Sale row: ${oldestId} (Delete/tool-remove).`);
-    await clickControl(page, 'row-remove', { context });
-    await clickControl(page, 'confirm', { context });
+    log(`Taking oldest On Sale row off sale: ${oldestId} (Take off Sale/tool-delist).`);
+    log(`On Sale controls: ${JSON.stringify(await page.evaluate(deletionControlState, context))}`);
+    await clickControl(page, 'row-delist', { context });
+    await settle(page);
+    // Delisting can reveal Delete inline or move this exact ID into Drafts.
+    // Never select the next oldest row after the original leaves On Sale.
+    const removalContext = { ...context, delisted: true };
+    const inline = await page.evaluateHandle(findControl, 'row-remove', removalContext);
+    let inlineReady;
+    try { inlineReady = Boolean(inline.asElement()); } finally { await inline.dispose(); }
+    // Lazy loading avoids the drafts -> listing-controls module cycle.
+    const { findDraft } = require('./drafts');
+    if (!inlineReady) {
+        log(`Locating delisted listing ${oldestId} in saved drafts by ID...`);
+        if (!await findDraft(page, oldestId, message => log(`Delisted listing lookup: ${message}`))) {
+            throw new Error('The delisted listing could not be located by ID. No other listing was selected or deleted.');
+        }
+    }
+    log(`Deleting delisted row: ${oldestId} (Delete/tool-remove, then primary Delete confirmation).`);
+    await clickControl(page, 'row-remove', { context: removalContext });
+    await clickControl(page, 'confirm', { context: removalContext });
     await settle(page);
 
     // A confirmation click is not proof the server accepted the deletion.
@@ -440,6 +488,12 @@ async function deleteOldestListing(page, log, publishedId) {
     await requireOldestSort(page);
     if ((await activeListingLinks(page)).some(url => listingId(url) === oldestId)) {
         throw new Error('The oldest listing is still On Sale; posting paused to preserve the listing count.');
+    }
+    // Absence from On Sale proves only delisting. A rejected Delete must not
+    // be reported as successful while the off-sale draft still exists.
+    log(`Verifying deleted listing ${oldestId} is absent from saved drafts...`);
+    if (await findDraft(page, oldestId, message => log(`Deletion verification: ${message}`))) {
+        throw new Error('The oldest listing is still saved in Drafts after Delete; posting paused.');
     }
     log('✅ Oldest listing deletion verified.');
 }

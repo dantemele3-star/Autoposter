@@ -218,4 +218,23 @@ async function openDraft(page, draft, log, stopped = () => false) {
     return true;
 }
 
-module.exports = { scanDrafts, openDraft };
+// Read-only identity lookup; shares the complete pagination/readiness safeguards.
+// Leaves the matching page open so callers can act on that exact saved listing.
+async function findDraft(page, key, log = () => {}) {
+    // This lookup verifies a recent delist/delete. A cached page from the
+    // original queue scan cannot prove that the saved listing is now absent.
+    await page.setCacheEnabled(false);
+    try {
+        const seen = new Set();
+        return await walkPages(page, (rows, ordinal) => {
+            if (rows.length && rows.every(row => seen.has(row.key))) {
+                throw new Error(`Draft page ${ordinal} contained only already scanned drafts; deletion verification paused.`);
+            }
+            rows.forEach(row => seen.add(row.key));
+            const row = rows.find(row => row.key === key);
+            return row ? { ...row, page: ordinal } : null;
+        }, log, () => false);
+    } finally { await page.setCacheEnabled(true); }
+}
+
+module.exports = { scanDrafts, openDraft, findDraft };
