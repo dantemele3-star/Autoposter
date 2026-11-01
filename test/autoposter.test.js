@@ -344,18 +344,28 @@ test('oldest deletion ignores navigation/profile menus and waits for sorted rows
     assert.equal(state.delisted || 0, 1);
     assert.deepEqual(state.delistedIds, [OLD]);
     assert.equal((await browser.pages()).length, tabs);
-    assert.match(logs.at(-1), /deletion verified/);
+    assert.match(logs.at(-1), /Delete confirmation clicked/);
     assert.equal(await page.$eval('#profile', el => el.matches(':hover')), false);
 });
 
 test('On Sale maintenance takes off sale, deletes, and confirms only the oldest ID', async () => {
     state.listings.unshift(NEW);
-    await controls.deleteOldestListing(page, () => {}, NEW);
+    state.draftPages = [[NEXT]];
+    const logs = [];
+    await controls.deleteOldestListing(page, message => logs.push(message), NEW);
     assert.deepEqual(state.deleted, [OLD]);
     assert.deepEqual(state.listings, [NEW, RECENT]);
     assert.equal(state.delisted || 0, 1);
     assert.deepEqual(state.delistedIds, [OLD]);
     assert.equal(state.visits.some(path => path.startsWith('/item/')), false);
+    const deletion = state.visits.indexOf('/fixture/delete');
+    assert.ok(deletion >= 0);
+    // The fixture redirects after Delete, just as the site can. The app must
+    // not add another navigation, sorting request, or Drafts scan afterward.
+    assert.deepEqual(state.visits.slice(deletion + 1).filter(path => path !== '/favicon.ico'), ['/listings/onsale']);
+    assert.equal(state.visits.includes('/listings/draft'), false);
+    assert.deepEqual(state.draftPages, [[NEXT]], 'The saved source draft is preserved');
+    assert.equal(logs.some(message => /Deletion verification|deletion verified|absent from saved drafts/.test(message)), false);
 });
 
 test('title and toolbar Copy links for the same listing resolve to one Delete button', async () => {
@@ -432,17 +442,18 @@ test('a delisted listing moved to a later Drafts page is found by ID and fully d
     assert.equal(state.cacheEnabled, true);
 });
 
-test('fresh Drafts reads detect a failed Delete despite a stale pre-delist cache', async () => {
+test('a delisted row found in Drafts is not scanned again after Delete confirmation', async () => {
     state.moveDelisted = true;
-    state.rejectDelete = true;
     state.staleDraftCache = true;
-    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /still saved in Drafts/);
+    await controls.deleteOldestListing(page, () => {}, NEW);
     assert.deepEqual(state.delistedIds, [OLD]);
-    assert.deepEqual(state.offSale, [OLD]);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.deepEqual(state.offSale, []);
+    assert.deepEqual(state.visits.slice(state.visits.indexOf('/fixture/delete') + 1).filter(path => path !== '/favicon.ico'), ['/listings/onsale']);
     assert.equal(state.cacheEnabled, true);
 });
 
-test('a reordered repeated Drafts page cannot prove the deleted ID is absent', async () => {
+test('delisted listing lookup rejects a reordered repeated Drafts page', async () => {
     const ids = sourceIds(0x77000000, 50);
     state.draftPages = [ids, [...ids].reverse()];
     await assert.rejects(drafts.findDraft(page, OLD), /only already scanned drafts/);
@@ -807,7 +818,7 @@ test('scans 105 drafts before posting a selected ID, verifying publication and d
     const scan = main.logs.findIndex(message => message.includes('Scan complete: 105 unique drafts'));
     assert.ok(scan >= 0 && scan < main.logs.findIndex(message => message.includes('Processing Item 1/105')));
     assert.ok(main.logs.findIndex(message => message.includes('Publication confirmed')) <
-        main.logs.findIndex(message => message.includes('Oldest listing deletion verified')));
+        main.logs.findIndex(message => message.includes('Oldest listing Delete confirmation clicked')));
     const history = JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json')));
     assert.equal(history.submissions.length, 1);
     assert.ok(history.cooldownUntil > Date.now());
@@ -1225,9 +1236,10 @@ test('Done waits for a busy editor to finish initializing its click handler', as
 test('Done never retries after the editor identity changes', async () => {
     await controls.navigate(page, `https://gameflip.com/listings/${NEW}/edit`);
     await page.evaluate(id => {
-        document.querySelector('button').onclick = () => history.replaceState({}, '', `/sell_item/${id}`);
+        document.querySelector('.listings-container button').onclick = () => history.replaceState({}, '', `/sell_item/${id}`);
     }, OLD);
     await assert.rejects(controls.advanceEditor(page, { timeoutMs: 6000 }), /identity changed/);
+    assert.equal(controls.listingId(page.url()), OLD);
     assert.equal(state.posts, 0);
     assert.deepEqual(state.deleted, []);
 });
@@ -1299,11 +1311,16 @@ test('current On Sale traffic still blocks deletion instead of guessing sorted r
     assert.deepEqual(state.listings, [NEW, RECENT, OLD]);
 });
 
-test('failed server deletion is reported, not counted as successful', async () => {
+test('a silent server rejection is not checked or logged as verified after Delete confirmation', async () => {
     state.rejectDelete = true;
-    await assert.rejects(controls.deleteOldestListing(page, () => {}, NEW), /still saved in Drafts/);
+    const logs = [];
+    await controls.deleteOldestListing(page, message => logs.push(message), NEW);
     assert.deepEqual(state.listings, [RECENT]);
     assert.deepEqual(state.offSale, [OLD]);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.deepEqual(state.visits.slice(state.visits.indexOf('/fixture/delete') + 1).filter(path => path !== '/favicon.ico'), ['/listings/onsale']);
+    assert.match(logs.at(-1), /Delete confirmation clicked/);
+    assert.equal(logs.some(message => /deletion verified/.test(message)), false);
 });
 
 test('the newly published listing is protected when it is the only listing', async () => {
@@ -1350,13 +1367,14 @@ test('rejected post never triggers deletion', async () => {
 
 test('maintenance failure stops further posts and retains the confirmed count', async () => {
     state.drafts = 2;
-    state.rejectDelete = true;
+    state.rejectDelist = true;
     const main = mainProcess();
     const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true, loop: true });
     assert.equal(result.success, false);
     assert.equal(result.postedCount, 1);
     assert.equal(state.posts, 1);
-    assert.match(result.error, /still saved in Drafts/);
+    assert.match(result.error, /delisted listing could not be located by ID/);
+    assert.deepEqual(state.deleted, []);
 });
 
 test('overlapping runs are rejected and Stop interrupts the rate-limit wait', async () => {
@@ -1456,9 +1474,9 @@ test('Copy Logs writes and verifies Unicode logs through the main-process clipbo
     const main = mainProcess({ clipboard: {
         writeText: async text => { copied = text.replace(/\n/g, '\r\n'); }, readText: async () => copied
     } });
-    const result = await main.handlers.get('copy-logs')({}, '✅ Publication confirmed.\n🧹 Oldest listing deletion verified.');
+    const result = await main.handlers.get('copy-logs')({}, '✅ Publication confirmed.\nOldest listing Delete confirmation clicked.');
     assert.equal(result.success, true);
-    assert.equal(copied, '✅ Publication confirmed.\r\n🧹 Oldest listing deletion verified.');
+    assert.equal(copied, '✅ Publication confirmed.\r\nOldest listing Delete confirmation clicked.');
 });
 
 test('Copy Logs reports Windows clipboard errors, silent failures and invalid input', async () => {

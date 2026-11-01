@@ -146,7 +146,7 @@ async function processDrafts(run, config, budget) {
                 log('✅ Publication confirmed.');
                 if (config.maintainLimit) {
                     if (!publishedId) throw new Error('Publication succeeded, but its ID could not be identified. Count maintenance paused; nothing was deleted.');
-                    run.step('Deleting and verifying the oldest listing');
+                    run.step('Deleting the oldest On Sale listing');
                     await deleteOldestListing(page, log, publishedId);
                 }
             } finally {

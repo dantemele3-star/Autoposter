@@ -345,7 +345,8 @@ async function advanceEditor(page, { log = () => {}, timeoutMs = page.getDefault
         }
         await sleep(100);
     }
-    throw new Error('Timed out waiting for Done to reach the List Item preview; posting paused without submitting.');
+    const waitingFor = attempts ? 'Done to reach the List Item preview' : 'Done control in the draft editor';
+    throw new Error(`Timed out waiting for ${waitingFor} on ${new URL(page.url()).pathname}; posting paused without submitting.`);
 }
 
 async function popupControl(page) {
@@ -534,20 +535,7 @@ async function deleteOldestListing(page, log, publishedId) {
     await clickControl(page, 'row-remove', { context: removalContext });
     await clickControl(page, 'confirm', { context: removalContext });
     await settle(page);
-
-    // A confirmation click is not proof the server accepted the deletion.
-    await navigate(page, ON_SALE);
-    await requireOldestSort(page);
-    if ((await activeListingLinks(page)).some(url => listingId(url) === oldestId)) {
-        throw new Error('The oldest listing is still On Sale; posting paused to preserve the listing count.');
-    }
-    // Absence from On Sale proves only delisting. A rejected Delete must not
-    // be reported as successful while the off-sale draft still exists.
-    log(`Verifying deleted listing ${oldestId} is absent from saved drafts...`);
-    if (await findDraft(page, oldestId, message => log(`Deletion verification: ${message}`))) {
-        throw new Error('The oldest listing is still saved in Drafts after Delete; posting paused.');
-    }
-    log('✅ Oldest listing deletion verified.');
+    log(`Oldest listing Delete confirmation clicked: ${oldestId}.`);
 }
 
 // Runs in Chrome for both the pre-click snapshot and publication observation.

@@ -117,8 +117,10 @@ published, opens On Sale, and selects **Created: Oldest**. It clicks that row's
 (`tool-remove`), then the primary **Delete** confirmation. Delete becomes
 available after taking the listing off sale. If the row moves into Drafts, the
 app finds it there by its original listing ID, across all necessary pages.
-It verifies that the ID is absent from both On Sale and saved Drafts; taking
-an item off sale alone is not reported as deletion. It rechecks the target ID
+After the Delete confirmation, the app continues without revisiting On Sale or
+scanning Drafts to verify deletion. The log records that the confirmation was
+clicked; it does not verify that Gameflip accepted the deletion. The source draft
+used to create the new listing is not a deletion target. It rechecks the target ID
 after action pauses and popup handling; missing, changed, or ambiguous controls
 pause the run without guessing another target. It never falls
 back to deleting the first unsorted item and does not delete the newly posted
@@ -130,9 +132,9 @@ control counts before deletion and when a deletion control times out. These
 diagnostics contain counts and the target listing ID, without page HTML or
 account data.
 
-If posting, sorting, or deletion cannot be confirmed, the run pauses with an
-error. Check Gameflip before restarting after an uncertain publication, to avoid
-posting a duplicate. The pointer is moved out of the header before actions, and
+If publication, sorting, or a required deletion control cannot be confirmed, the
+run pauses with an error. Check Gameflip before restarting after an uncertain
+publication, to avoid posting a duplicate. The pointer is moved out of the header before actions, and
 profile menus and section navigation links are excluded from deletion targets.
 ## Timing and posting limits
 
