@@ -5,7 +5,7 @@ const fs = require('fs');
 const os = require('os');
 
 const {
-    clickControl, waitForControl, navigate, dismissPopup,
+    clickControl, waitForControl, advanceEditor, navigate, dismissPopup,
     deleteOldestListing, capturePublication, waitForPublished
 } = require('./listing-controls');
 const { scanDrafts, openDraft } = require('./drafts');
@@ -123,7 +123,7 @@ async function processDrafts(run, config, budget) {
             if (!await openDraft(page, item, log, () => shouldStop)) break;
             await dismissPopup(page);
             run.step('Waiting for Done in the draft editor');
-            await clickControl(page, 'done');
+            await advanceEditor(page, { log });
             await dismissPopup(page);
             // Wait for the preview before capturing the new copy's ID.
             run.step('Waiting for List Item in the listing preview');

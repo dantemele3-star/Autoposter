@@ -1174,6 +1174,64 @@ test('publication observation can outwait the ordinary page timeout and a visibl
     assert.equal(await controls.waitForPublished(page, context, { timeoutMs: 1000 }), null);
 });
 
+test('Done retries one ignored trusted click on the same sell_item editor without submitting', async () => {
+    await controls.navigate(page, `https://gameflip.com/listings/${NEW}/edit`);
+    await page.evaluate(id => {
+        history.replaceState({}, '', `/sell_item/${id}`);
+        window.doneClicks = 0;
+        document.body.innerHTML = `<button id="done">Done</button>`;
+        document.querySelector('#done').onclick = event => {
+            if (!event.isTrusted) return;
+            if (++window.doneClicks === 2) document.body.innerHTML = '<button>List Item</button>';
+        };
+    }, NEW);
+    await controls.advanceEditor(page, { timeoutMs: 7000 });
+    assert.equal(await page.evaluate(() => window.doneClicks), 2);
+    assert.equal(state.posts, 0);
+    assert.deepEqual(state.deleted, []);
+});
+
+test('Done pauses after two ignored clicks instead of submitting or retrying indefinitely', async () => {
+    await controls.navigate(page, `https://gameflip.com/listings/${NEW}/edit`);
+    await page.evaluate(id => {
+        history.replaceState({}, '', `/sell_item/${id}`);
+        window.doneClicks = 0;
+        document.body.innerHTML = '<button onclick="window.doneClicks++">Done</button>';
+    }, NEW);
+    await assert.rejects(controls.advanceEditor(page, { timeoutMs: 8000 }), /ignored twice/);
+    assert.equal(await page.evaluate(() => window.doneClicks), 2);
+    assert.equal(state.posts, 0);
+    assert.deepEqual(state.deleted, []);
+});
+
+test('Done waits for a busy editor to finish initializing its click handler', async () => {
+    await controls.navigate(page, `https://gameflip.com/listings/${NEW}/edit`);
+    await page.evaluate(() => {
+        window.doneClicks = 0;
+        document.body.innerHTML = '<main aria-busy="true"><button>Done</button></main>';
+        setTimeout(() => {
+            document.querySelector('main').removeAttribute('aria-busy');
+            document.querySelector('button').onclick = () => {
+                window.doneClicks++;
+                document.body.innerHTML = '<button>List Item</button>';
+            };
+        }, 1500);
+    });
+    await controls.advanceEditor(page, { timeoutMs: 5000 });
+    assert.equal(await page.evaluate(() => window.doneClicks), 1);
+    assert.equal(state.posts, 0);
+});
+
+test('Done never retries after the editor identity changes', async () => {
+    await controls.navigate(page, `https://gameflip.com/listings/${NEW}/edit`);
+    await page.evaluate(id => {
+        document.querySelector('button').onclick = () => history.replaceState({}, '', `/sell_item/${id}`);
+    }, OLD);
+    await assert.rejects(controls.advanceEditor(page, { timeoutMs: 6000 }), /identity changed/);
+    assert.equal(state.posts, 0);
+    assert.deepEqual(state.deleted, []);
+});
+
 test('actual browser click events are separated by at least the action delay', async () => {
     setPagePacer(page);
     await page.setContent('<button onclick="window.clicks.push(performance.now())">Done</button>');

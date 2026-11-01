@@ -296,6 +296,58 @@ async function clickControl(page, action, { context = {}, ...options } = {}) {
     throw new Error(`The ${action} control kept changing while popups were being dismissed; posting paused.`);
 }
 
+// Done saves the copy into its preview; it must never be confused with the
+// separately budgeted List Item submission. Retry only on the same editor.
+async function advanceEditor(page, { log = () => {}, timeoutMs = page.getDefaultTimeout() || 30000 } = {}) {
+    const deadline = Date.now() + timeoutMs;
+    const network = await trackPageNetwork(page);
+    let editorUrl, editorId, stableSince = 0, lastClick = 0, attempts = 0;
+    while (Date.now() < deadline) {
+        try {
+            await dismissPopup(page);
+            const preview = await page.evaluateHandle(findControl, 'list');
+            const ready = Boolean(preview.asElement());
+            await preview.dispose();
+            if (ready) return;
+            const url = page.url();
+            const done = await page.evaluateHandle(findControl, 'done');
+            let usable;
+            try {
+                usable = done.asElement() && await done.evaluate(el => {
+                    el.scrollIntoView({ block: 'center', behavior: 'instant' });
+                    const r = el.getBoundingClientRect();
+                    const hit = document.elementFromPoint(r.x + r.width / 2, r.y + r.height / 2);
+                    return document.readyState === 'complete' && (hit === el || el.contains(hit)) &&
+                        !document.querySelector('[aria-busy="true"]');
+                });
+            } finally { await done.dispose(); }
+            const pending = [...network.pending.values()].some(r => ['Document', 'XHR', 'Fetch'].includes(r.type));
+            if (!usable || pending) stableSince = 0;
+            else {
+                if (!stableSince) stableSince = Date.now();
+                if (Date.now() - stableSince >= 1000 && Date.now() - lastClick >= 2000) {
+                    if (attempts && (url !== editorUrl || !editorId || listingId(url) !== editorId)) {
+                        throw new Error('Editor identity changed after Done; posting paused without submitting.');
+                    }
+                    if (attempts >= 2) throw new Error('Done was ignored twice on the unchanged editor; posting paused without submitting.');
+                    editorUrl = url;
+                    editorId = listingId(url);
+                    log(attempts ? 'Done left the same editor ready; retrying Done once.' : 'Editor ready; clicking Done with the mouse.');
+                    await clickControl(page, 'done', { useMouse: true });
+                    attempts++;
+                    lastClick = Date.now();
+                    stableSince = 0;
+                }
+            }
+        } catch (error) {
+            if (!changingContext(error)) throw error;
+            stableSince = 0;
+        }
+        await sleep(100);
+    }
+    throw new Error('Timed out waiting for Done to reach the List Item preview; posting paused without submitting.');
+}
+
 async function popupControl(page) {
     if (page.isClosed()) throw new Error('Browser page closed while checking notification popups.');
     for (const frame of page.frames()) {
@@ -604,6 +656,6 @@ async function waitForPublished(page, context, {
 }
 
 module.exports = {
-    listingId, findControl, clickElement, clickControl, waitForControl, navigate, dismissPopup,
+    listingId, findControl, clickElement, clickControl, waitForControl, advanceEditor, navigate, dismissPopup,
     deleteOldestListing, capturePublication, waitForPublished, settle, usablePageResponse, pendingListingRequests, changingContext
 };
