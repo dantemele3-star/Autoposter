@@ -151,8 +151,11 @@ are still checked for notification prompts. Draft readiness retries temporary
 page-context replacements within its existing timeout and revalidates the source
 ID before copying; closed pages and other protocol failures still stop the run.
 
-Navigation and clicks are separated by at least two seconds after the previous
-action completes. Controls must also be ready before they are clicked. After
+Each navigation or click gets a fresh random delay of 2–4 seconds after the
+previous action completes. Time already spent waiting for the page counts toward
+that delay; page readiness can make the gap longer. This timing variance is
+always enabled and is separate from randomizing the draft order. Controls must
+also be ready before they are clicked. After
 List Item, the app allows a 90-second confirmation window and checks On Sale by
 the copied listing's ID, including subsequent pages. A List Item button on the
 On Sale page does not prevent confirmation. Verification only reads pages; it

@@ -4,7 +4,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { PostingBudget, POST_INTERVAL_MS, DAY_MS, DAILY_LIMIT, CONFIRMATION_TIMEOUT_MS } = require('../posting-budget');
-const { ActionPacer, MIN_CLICK_DELAY_MS } = require('../pacing');
+const { ActionPacer, MIN_CLICK_DELAY_MS, MAX_CLICK_DELAY_MS } = require('../pacing');
 
 let folder, file, clock;
 beforeEach(() => {
@@ -60,9 +60,10 @@ test('an unreadable history never resets the cap or permits a new post', () => {
     assert.equal(fs.readFileSync(file, 'utf8'), 'broken history');
 });
 
-test('the action pacer waits after the previous action completes and counts existing idle time', async () => {
+test('the action pacer counts existing idle time toward its randomized delay after action completion', async () => {
     const waits = [];
-    const pacer = new ActionPacer({ now: () => clock, sleep: async ms => { waits.push(ms); clock += ms; } });
+    const pacer = new ActionPacer({ now: () => clock, random: () => 0.5,
+        sleep: async ms => { waits.push(ms); clock += ms; } });
     await pacer.wait();
     const first = clock;
     clock += 200; // Time spent dispatching the first click.
@@ -70,9 +71,23 @@ test('the action pacer waits after the previous action completes and counts exis
     clock += 400;
     await pacer.wait();
     assert.ok(clock - first >= MIN_CLICK_DELAY_MS + 200);
-    assert.deepEqual(waits, [2000, 1600]);
+    assert.deepEqual(waits, [3000, 2600]);
     pacer.mark();
     clock += 5000;
     await pacer.wait();
     assert.equal(waits.length, 2);
+});
+
+test('the action pacer samples a fresh delay for every action within the two-to-four-second bounds', async () => {
+    const samples = [0, 0.5, 1 - Number.EPSILON];
+    const waits = [];
+    const pacer = new ActionPacer({ now: () => clock, random: () => samples.shift(),
+        sleep: async ms => { waits.push(ms); clock += ms; } });
+    for (let i = 0; i < 3; i++) {
+        await pacer.wait();
+        pacer.mark();
+    }
+    assert.deepEqual(waits, [2000, 3000, 4000]);
+    assert.ok(waits.every(ms => ms >= MIN_CLICK_DELAY_MS && ms <= MAX_CLICK_DELAY_MS));
+    assert.equal(samples.length, 0);
 });

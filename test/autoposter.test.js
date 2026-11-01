@@ -1244,15 +1244,15 @@ test('Done never retries after the editor identity changes', async () => {
     assert.deepEqual(state.deleted, []);
 });
 
-test('actual browser click events are separated by at least the action delay', async () => {
-    setPagePacer(page);
+test('actual browser click events respect the sampled randomized action delay', async () => {
+    setPagePacer(page, new ActionPacer({ random: () => 0.75 }));
     await page.setContent('<button onclick="window.clicks.push(performance.now())">Done</button>');
     await page.evaluate(() => { window.clicks = []; });
     await controls.clickControl(page, 'done');
     await controls.clickControl(page, 'done');
     const clicks = await page.evaluate(() => window.clicks);
     assert.equal(clicks.length, 2);
-    assert.ok(clicks[1] - clicks[0] >= 1990, 'Clicks were not paced by two seconds');
+    assert.ok(clicks[1] - clicks[0] >= 3490, 'Clicks did not respect the sampled 3.5-second delay');
 });
 
 test('finds a freshly rendered control after the action pause', async () => {

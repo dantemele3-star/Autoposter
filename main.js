@@ -79,7 +79,7 @@ async function processDrafts(run, config, budget) {
 
         log("\n--- 👻 GHOST SESSION STARTED ---");
         log(`Mode: ${config.headless ? 'Headless (Hidden)' : 'Headed (Visible)'}`);
-        log(`Tracked app submissions in the last 24 hours: ${budget.status().count}/${DAILY_LIMIT}. Browser actions are spaced by at least 2 seconds.`);
+        log(`Tracked app submissions in the last 24 hours: ${budget.status().count}/${DAILY_LIMIT}. Browser action spacing is randomized between 2 and 4 seconds, plus any page-readiness waits.`);
         run.step('Navigating to Gameflip Drafts');
         await navigate(page, 'https://gameflip.com/listings/draft', { waitForIdle: false });
 
