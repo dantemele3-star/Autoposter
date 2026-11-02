@@ -28,7 +28,7 @@ async function waitForPostingSlot(run, budget) {
     const { waitMs } = budget.status();
     if (waitMs > 0 && !shouldStop) {
         run.step('Waiting for the posting interval');
-        run.write(`⏳ Rate Limit Protection: ${Math.ceil(waitMs / 1000)}s remain in the 220-second minimum posting interval...`);
+        run.write(`⏳ Rate Limit Protection: ${Math.ceil(waitMs / 1000)}s remain in the saved posting cooldown (normally randomized between 220 and 230 seconds)...`);
         await waitBetweenPosts(waitMs);
     }
     return !shouldStop;

@@ -2,14 +2,16 @@ const fs = require('node:fs');
 const path = require('node:path');
 
 const POST_INTERVAL_MS = 220000;
+const MAX_POST_INTERVAL_MS = 230000;
 const DAY_MS = 24 * 60 * 60 * 1000;
 const DAILY_LIMIT = 400;
 const CONFIRMATION_TIMEOUT_MS = 90000;
 
 class PostingBudget {
-    constructor(file, { now = Date.now } = {}) {
+    constructor(file, { now = Date.now, random = Math.random } = {}) {
         this.file = file;
         this.now = now;
+        this.random = random;
     }
 
     load(now) {
@@ -42,10 +44,10 @@ class PostingBudget {
         const now = this.now();
         const state = this.load(now);
         const status = this.check(state, now);
-        if (status.waitMs > 0) throw new Error(`The 220-second posting interval has not elapsed (${Math.ceil(status.waitMs / 1000)} seconds remain).`);
+        if (status.waitMs > 0) throw new Error(`The saved posting interval has not elapsed (${Math.ceil(status.waitMs / 1000)} seconds remain; 220-second minimum).`);
         state.submissions.push(now);
         // A crash during confirmation must not permit an immediate restart.
-        state.cooldownUntil = now + CONFIRMATION_TIMEOUT_MS + POST_INTERVAL_MS;
+        state.cooldownUntil = now + CONFIRMATION_TIMEOUT_MS + MAX_POST_INTERVAL_MS;
         this.save(state);
         return state.submissions.length;
     }
@@ -53,7 +55,10 @@ class PostingBudget {
     finishAttempt() {
         const now = this.now();
         const state = this.load(now);
-        state.cooldownUntil = now + POST_INTERVAL_MS;
+        // Sample once after confirmation/maintenance; persist the deadline so
+        // status checks and restarts never reroll or shorten the selected wait.
+        const interval = POST_INTERVAL_MS + Math.floor(this.random() * (MAX_POST_INTERVAL_MS - POST_INTERVAL_MS + 1));
+        state.cooldownUntil = now + interval;
         this.save(state);
     }
 
@@ -69,4 +74,4 @@ class PostingBudget {
     }
 }
 
-module.exports = { PostingBudget, POST_INTERVAL_MS, DAY_MS, DAILY_LIMIT, CONFIRMATION_TIMEOUT_MS };
+module.exports = { PostingBudget, POST_INTERVAL_MS, MAX_POST_INTERVAL_MS, DAY_MS, DAILY_LIMIT, CONFIRMATION_TIMEOUT_MS };

@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { PostingBudget, POST_INTERVAL_MS, DAY_MS, DAILY_LIMIT, CONFIRMATION_TIMEOUT_MS } = require('../posting-budget');
+const { PostingBudget, POST_INTERVAL_MS, MAX_POST_INTERVAL_MS, DAY_MS, DAILY_LIMIT, CONFIRMATION_TIMEOUT_MS } = require('../posting-budget');
 const { ActionPacer, MIN_CLICK_DELAY_MS, MAX_CLICK_DELAY_MS } = require('../pacing');
 
 let folder, file, clock;
@@ -13,7 +13,7 @@ beforeEach(() => {
     clock = 1800000000000;
 });
 afterEach(() => fs.rmSync(folder, { recursive: true, force: true }));
-const budget = () => new PostingBudget(file, { now: () => clock });
+const budget = () => new PostingBudget(file, { now: () => clock, random: () => 0 });
 
 test('the 220-second cooldown survives restarts and releases at the exact boundary', () => {
     assert.equal(budget().reserve(), 1);
@@ -31,8 +31,47 @@ test('an interrupted confirmation retains its submission and conservative cooldo
     clock += 1000;
     const restored = budget().status();
     assert.equal(restored.count, 1);
-    assert.equal(restored.waitMs, POST_INTERVAL_MS + CONFIRMATION_TIMEOUT_MS - 1000);
+    assert.equal(restored.waitMs, MAX_POST_INTERVAL_MS + CONFIRMATION_TIMEOUT_MS - 1000);
     assert.throws(() => budget().reserve(), /interval has not elapsed/);
+});
+
+test('completed attempts sample new cooldowns at the minimum, midpoint and maximum', () => {
+    const samples = [0, 0.5, 1 - Number.EPSILON];
+    const posting = new PostingBudget(file, { now: () => clock, random: () => samples.shift() });
+    for (const expected of [220000, 225000, 230000]) {
+        posting.reserve();
+        clock += 12000;
+        posting.finishAttempt();
+        assert.equal(posting.status().waitMs, expected);
+        assert.ok(expected >= POST_INTERVAL_MS && expected <= MAX_POST_INTERVAL_MS);
+        clock += expected;
+    }
+    assert.equal(samples.length, 0, 'Only finished attempts should sample a cooldown');
+});
+
+test('a randomized cooldown survives repeated checks and restart without rerolling its deadline', () => {
+    const posting = new PostingBudget(file, { now: () => clock, random: () => 0.5 });
+    posting.reserve();
+    posting.finishAttempt();
+    const saved = fs.readFileSync(file, 'utf8');
+    const restored = new PostingBudget(file, { now: () => clock, random: () => { throw new Error('Unexpected reroll'); } });
+    assert.equal(restored.status().waitMs, 225000);
+    assert.equal(restored.status().waitMs, 225000);
+    clock += 224999;
+    assert.equal(restored.status().waitMs, 1);
+    assert.throws(() => restored.reserve(), /interval has not elapsed/);
+    assert.equal(fs.readFileSync(file, 'utf8'), saved);
+    clock++;
+    assert.equal(restored.reserve(), 2);
+});
+
+test('existing version-one posting history keeps its saved cooldown and submissions', () => {
+    fs.writeFileSync(file, JSON.stringify({ version: 1, submissions: [clock - 10000], cooldownUntil: clock + 1000 }));
+    assert.deepEqual(budget().status(), { count: 1, waitMs: 1000 });
+    assert.throws(() => budget().reserve(), /interval has not elapsed/);
+    clock += 1000;
+    assert.equal(budget().reserve(), 2);
+    assert.deepEqual(JSON.parse(fs.readFileSync(file)).submissions, [clock - 11000, clock]);
 });
 
 test('400 tracked submissions block the next attempt until a rolling-24-hour slot expires', () => {

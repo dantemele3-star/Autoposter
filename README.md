@@ -170,10 +170,11 @@ Gameflip data and non-tracking documents
 still have to settle before deletion. A verification failure keeps its recorded
 submission and reports the uncertain outcome without submitting again.
 
-There is a minimum 220-second cooldown after a submission and its verification
-or count maintenance finish. Stop, restart, and continuous loops preserve that
-cooldown. A single-instance lock prevents a second copy of the app running at
-the same time.
+After a submission and its verification or count maintenance finish, the app
+chooses a fresh random cooldown of 220–230 seconds. The log shows the actual
+remaining wait. Stop, restart, and continuous loops preserve the saved deadline
+without rerolling it. Existing saved cooldowns are honored. A single-instance lock
+prevents a second copy of the app running at the same time.
 
 The app caps its recorded submissions at 400 in a rolling 24-hour period. An
 attempt is recorded before the submit click, so a post with an uncertain outcome

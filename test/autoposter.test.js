@@ -1275,7 +1275,7 @@ test('restarting after one post preserves the cooldown before any new website ac
     const second = mainProcess({ stateFolder: first.stateFolder });
     const run = second.handlers.get('process-drafts')({ sender: {} }, {});
     await new Promise(resolve => setTimeout(resolve, 20));
-    assert.ok(second.logs.some(message => message.includes('220-second minimum')));
+    assert.ok(second.logs.some(message => message.includes('randomized between 220 and 230 seconds')));
     assert.equal(state.requests.length, requestCount);
     await second.handlers.get('stop-drafts')();
     assert.equal((await run).postedCount, 0);
@@ -1427,7 +1427,7 @@ test('a one-draft continuous loop still waits for the posting rate limit', async
     assert.equal(result.success, true, result.error);
     assert.equal(result.postedCount, 1);
     assert.equal(state.posts, 1);
-    assert.ok(main.logs.some(message => message.includes('220-second minimum posting interval')));
+    assert.ok(main.logs.some(message => message.includes('randomized between 220 and 230 seconds')));
 });
 
 test('the GUI captures the checkbox and locks settings until posting finishes', async () => {
