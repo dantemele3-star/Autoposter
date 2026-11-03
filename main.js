@@ -12,6 +12,7 @@ const { scanDrafts, openDraft } = require('./drafts');
 const { PostingBudget, DAILY_LIMIT } = require('./posting-budget');
 const { RunLog, redact } = require('./run-log');
 const { version } = require('./package.json');
+const { launchSession } = require('./chrome-session');
 
 let shouldStop = false;
 let isRunning = false;
@@ -78,7 +79,8 @@ async function processDrafts(run, config, budget) {
     let postedCount = 0;
     try {
         run.step('Launching Chrome');
-        browser = await puppeteer.launch({
+        log(`Chrome mode: ${config.headless ? 'Hidden (no Chrome window will open)' : 'Visible'}.`);
+        browser = await launchSession(puppeteer, {
             headless: config.headless,
             defaultViewport: null,
             executablePath,
@@ -87,11 +89,12 @@ async function processDrafts(run, config, budget) {
             args: [
                 '--disable-blink-features=AutomationControlled',
                 '--start-maximized',
+                '--disable-background-mode',
                 '--disable-background-timer-throttling',
                 '--disable-backgrounding-occluded-windows',
                 '--disable-renderer-backgrounding'
             ]
-        });
+        }, { log, stopRequested: () => shouldStop });
 
         if (shouldStop) return { success: true, postedCount };
 
@@ -195,11 +198,6 @@ async function processDrafts(run, config, budget) {
         log(`Total successfully posted in this cycle: ${postedCount}`);
         return { success: true, postedCount };
     } catch (err) {
-        if (!browser && /The browser is already running for |Failed to create a ProcessSingleton/i.test(err.message)) {
-            err = new Error('The saved Gameflip Chrome session is already open or locked. Close its Chrome window and try again. ' +
-                'If no window is visible, save other Chrome work and restart Windows to release a leftover process. ' +
-                'Keep the Gameflip_Ghost_Session folder; your login profile and posting history have not been reset.', { cause: err });
-        }
         await run.report(err, page, postedCount);
         err.postedCount = postedCount;
         throw err;

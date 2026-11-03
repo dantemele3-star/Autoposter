@@ -55,6 +55,8 @@ function appMain(launch, controls = {}) {
             ipcMain: { handle: (name, handler) => handlers.set(name, handler), on() {} } }
             : name === 'puppeteer' ? { launch: options => { launches.push(options); return launch(options); } }
                 : name === './listing-controls' ? { ...applicationRequire(name), ...controls }
+                : name === './chrome-session' ? { launchSession: (puppeteer, options, settings) =>
+                    applicationRequire(name).launchSession(puppeteer, options, { ...settings, platform: 'test' }) }
                 : applicationRequire(name),
         process, console, setTimeout, Date, Math, AbortController
     });
@@ -74,10 +76,10 @@ test('profile-lock errors give recovery instructions without replacing the profi
         const result = await main.start();
         assert.equal(result.success, false);
         assert.equal(result.postedCount, 0);
-        assert.match(result.error, /already open or locked/);
-        assert.match(result.error, /Close its Chrome window/);
-        assert.match(result.error, /restart Windows/);
-        assert.match(result.error, /Keep the Gameflip_Ghost_Session folder/);
+        assert.match(result.error, /could not be recovered automatically/);
+        assert.match(result.error, /Other Chrome profiles were not stopped/);
+        assert.match(result.error, /posting history were not reset/);
+        assert.doesNotMatch(result.error, /restart Windows/);
     }
     assert.equal(main.launches.length, 2, 'A failed launch must release the run guard for another attempt');
     assert.equal(main.launches[0].userDataDir, main.launches[1].userDataDir);

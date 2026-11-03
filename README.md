@@ -17,16 +17,22 @@ The app finds Chrome in the standard Windows installation locations. Set
 Leave Hidden Mode unchecked when signing into Gameflip. Your existing
 `AppData\Local\Gameflip_Ghost_Session` login profile is preserved.
 
-If Chrome reports that this session is already running or locked, close the
-Chrome window opened by Autoposter and try again. If no window is visible, save
-other Chrome work and restart Windows to release a leftover process, then start
-Autoposter again. Keep `Gameflip_Ghost_Session`; deleting it would lose the saved
-login. This startup failure occurs before any listing is posted or deleted.
+On Windows, if launching this profile reports a lock, Autoposter checks Chrome
+command lines for the exact `Gameflip_Ghost_Session` profile path. It stops only
+matching browser processes, verifies that no process still uses that profile,
+removes a stale `lockfile` if present, and retries once using the same profile.
+Other Chrome profiles stay open. If Windows cannot verify ownership or release
+the lock, the app pauses with the recovery diagnostic. Login data and posting
+history are preserved; do not delete the profile folder.
+
+**Hidden Mode** launches Chrome without a visible window. Uncheck it to see
+the listing browser or sign in manually. The selected mode is logged before
+launch, including when launch fails.
 
 Closing Autoposter during a run requests Stop and waits for the current item,
 its saved cooldown, and Chrome cleanup before exiting. Leave the app open while
 that finishes. Forced termination, a crash, or Windows shutdown can still leave
-Chrome behind; the app does not kill other Chrome processes or replace the profile.
+Chrome behind; recovery targets only the dedicated Gameflip profile.
 
 ## Get updates without patches
 
@@ -215,6 +221,13 @@ posting and deletion failures, single-tab actions,
 overlapping runs, stopping, and loop rate limiting. They do not use your login
 profile or create/delete real Gameflip listings. The live site's current markup
 and the Windows desktop interaction still need checking on your PC.
+
+Profile-recovery tests use temporary profiles and synthetic cookies, including
+a real locked-profile relaunch while an unrelated Chrome instance stays open.
+The Windows recovery script is tested with simulated process lists, never live
+process termination. These script tests use Windows PowerShell on Windows; on
+Linux they run when `AUTOPOSTER_TEST_PWSH` points to a PowerShell executable and
+otherwise skip. Live Windows process inspection still needs checking on your PC.
 
 Regression coverage also checks asynchronous main-process clipboard writes and failures,
 the Take off Sale → row Delete → final confirmation sequence, rejection of changed

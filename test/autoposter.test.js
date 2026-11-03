@@ -11,6 +11,7 @@ const drafts = require('../drafts');
 const { ActionPacer, setPagePacer } = require('../pacing');
 const budgets = require('../posting-budget');
 const diagnostics = require('../run-log');
+const sessions = require('../chrome-session');
 
 const OLD = '11111111-1111-4111-8111-111111111111';
 const RECENT = '22222222-2222-4222-8222-222222222222';
@@ -329,7 +330,7 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8'), {
         require: name => name === 'electron' ? electron : name === 'puppeteer'
             ? { launch: async () => { if (launchError) throw launchError; return fakeBrowser; } } : name === './listing-controls' ? testingControls
-                : name === './drafts' ? drafts : name === './posting-budget' ? budgets
+                : name === './chrome-session' ? sessions : name === './drafts' ? drafts : name === './posting-budget' ? budgets
                     : name === './run-log' ? diagnostics : name === './package.json' ? require('../package.json') : require(name),
         process, console, setTimeout: global.setTimeout, AbortController, Math: Object.create(Math, { random: { value: random } }),
         Date: skipWaits ? TestClock : Date
