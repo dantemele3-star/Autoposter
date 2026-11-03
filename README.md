@@ -17,6 +17,17 @@ The app finds Chrome in the standard Windows installation locations. Set
 Leave Hidden Mode unchecked when signing into Gameflip. Your existing
 `AppData\Local\Gameflip_Ghost_Session` login profile is preserved.
 
+If Chrome reports that this session is already running or locked, close the
+Chrome window opened by Autoposter and try again. If no window is visible, save
+other Chrome work and restart Windows to release a leftover process, then start
+Autoposter again. Keep `Gameflip_Ghost_Session`; deleting it would lose the saved
+login. This startup failure occurs before any listing is posted or deleted.
+
+Closing Autoposter during a run requests Stop and waits for the current item,
+its saved cooldown, and Chrome cleanup before exiting. Leave the app open while
+that finishes. Forced termination, a crash, or Windows shutdown can still leave
+Chrome behind; the app does not kill other Chrome processes or replace the profile.
+
 ## Get updates without patches
 
 The maintained app is on the default `main` branch. Close Autoposter before

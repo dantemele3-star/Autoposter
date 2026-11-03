@@ -15,6 +15,28 @@ const { version } = require('./package.json');
 
 let shouldStop = false;
 let isRunning = false;
+let quitRequested = false;
+let activeRunFinished = Promise.resolve();
+let activeRunLog;
+let cancelLoginWait;
+
+function requestStop() {
+    shouldStop = true;
+    cancelLoginWait?.();
+}
+
+// Keep Electron alive until the current item and the owned Chrome cleanup
+// finish. Exiting midway can leave the persistent login profile locked.
+app.on('before-quit', event => {
+    if (!isRunning) return;
+    event.preventDefault();
+    if (quitRequested) return;
+    quitRequested = true;
+    requestStop();
+    activeRunLog?.write('Closing Autoposter: finishing the current item, saving its cooldown, and closing Chrome before exiting...');
+    void activeRunFinished.then(() => app.quit());
+});
+app.on('window-all-closed', () => app.quit());
 
 async function waitBetweenPosts(ms) {
     const end = Date.now() + ms;
@@ -71,6 +93,8 @@ async function processDrafts(run, config, budget) {
             ]
         });
 
+        if (shouldStop) return { success: true, postedCount };
+
         const pages = await browser.pages();
         page = pages.length > 0 ? pages[0] : await browser.newPage();
         run.attach(page, browser);
@@ -82,10 +106,18 @@ async function processDrafts(run, config, budget) {
         log(`Tracked app submissions in the last 24 hours: ${budget.status().count}/${DAILY_LIMIT}. Browser action spacing is randomized between 2 and 4 seconds, plus any page-readiness waits.`);
         run.step('Navigating to Gameflip Drafts');
         await navigate(page, 'https://gameflip.com/listings/draft', { waitForIdle: false });
+        if (shouldStop) return { success: true, postedCount };
 
         if (page.url().includes('login')) {
             run.step('Waiting for manual Gameflip login');
-            await page.waitForFunction(() => window.location.href.includes('/listings/draft'), { timeout: 600000 });
+            const controller = new AbortController();
+            cancelLoginWait = () => controller.abort();
+            try {
+                await page.waitForFunction(() => window.location.href.includes('/listings/draft'), { timeout: 600000, signal: controller.signal });
+            } catch (error) {
+                if (shouldStop && controller.signal.aborted) return { success: true, postedCount };
+                throw error;
+            } finally { cancelLoginWait = null; }
             log("✅ Login detected. Continuing...");
             await dismissPopup(page);
         }
@@ -163,6 +195,11 @@ async function processDrafts(run, config, budget) {
         log(`Total successfully posted in this cycle: ${postedCount}`);
         return { success: true, postedCount };
     } catch (err) {
+        if (!browser && /The browser is already running for |Failed to create a ProcessSingleton/i.test(err.message)) {
+            err = new Error('The saved Gameflip Chrome session is already open or locked. Close its Chrome window and try again. ' +
+                'If no window is visible, save other Chrome work and restart Windows to release a leftover process. ' +
+                'Keep the Gameflip_Ghost_Session folder; your login profile and posting history have not been reset.', { cause: err });
+        }
         await run.report(err, page, postedCount);
         err.postedCount = postedCount;
         throw err;
@@ -180,12 +217,16 @@ async function processDrafts(run, config, budget) {
 }
 
 ipcMain.handle('process-drafts', async (event, config = {}) => {
+    if (quitRequested) return { success: false, error: 'Autoposter is closing. Wait for Chrome cleanup before starting it again.' };
     if (isRunning) return { success: false, error: 'Posting is already running.' };
     const win = BrowserWindow.fromWebContents(event.sender);
     isRunning = true;
     shouldStop = false;
+    let finishRun;
+    activeRunFinished = new Promise(resolve => { finishRun = resolve; });
     let totalPosted = 0;
     const run = new RunLog(path.join(app.getPath('userData'), 'autoposter.log'), message => sendLog(win, message));
+    activeRunLog = run;
     try {
         run.write(`Autoposter v${version}; Node ${process.versions.node}; ${process.platform}.`);
         run.write(`Settings: ${JSON.stringify({ headless: !!config.headless, randomize: !!config.randomize, loop: !!config.loop, maintainLimit: !!config.maintainLimit })}`);
@@ -205,12 +246,14 @@ ipcMain.handle('process-drafts', async (event, config = {}) => {
         return { success: false, postedCount: totalPosted + (err.postedCount || 0), error: redact(err.message) };
     } finally {
         isRunning = false;
+        activeRunLog = null;
+        finishRun();
     }
 });
 
 ipcMain.handle('stop-drafts', async () => {
     console.log("🛑 Stop signal sent from GUI...");
-    shouldStop = true;
+    requestStop();
     return { success: true };
 });
 
@@ -255,6 +298,12 @@ if (!app.requestSingleInstanceLock()) {
         webPreferences: {
             nodeIntegration: true,
             contextIsolation: false
+        }
+    });
+    win.on('close', event => {
+        if (isRunning) {
+            event.preventDefault();
+            app.quit();
         }
     });
     win.loadFile('index.html');

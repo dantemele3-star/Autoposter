@@ -301,6 +301,7 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
     const handlers = new Map();
     const logs = [];
     const openedLogs = [];
+    let quitCount = 0;
     const win = { isDestroyed: () => false, webContents: { send: (_, message) => { logs.push(message); onLog(message); } } };
     let closed = false;
     const fakeBrowser = Object.assign(new EventEmitter(), { pages: async () => [page], close: async () => {
@@ -308,7 +309,13 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
         if (closeError) throw closeError;
     } });
     const electron = {
-        app: { getPath: () => stateFolder, whenReady: () => ({ then() {} }), requestSingleInstanceLock: () => true, quit() {} },
+        app: Object.assign(new EventEmitter(), { getPath: () => stateFolder, whenReady: () => ({ then() {} }), requestSingleInstanceLock: () => true,
+            quit() {
+                const event = { prevented: false, preventDefault() { this.prevented = true; } };
+                this.emit('before-quit', event);
+                if (!event.prevented) quitCount++;
+                return event;
+            } }),
         BrowserWindow: { fromWebContents: () => win },
         ipcMain: { handle: (name, handler) => handlers.set(name, handler), on() {} },
         clipboard,
@@ -324,10 +331,11 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
             ? { launch: async () => { if (launchError) throw launchError; return fakeBrowser; } } : name === './listing-controls' ? testingControls
                 : name === './drafts' ? drafts : name === './posting-budget' ? budgets
                     : name === './run-log' ? diagnostics : name === './package.json' ? require('../package.json') : require(name),
-        process, console, setTimeout: global.setTimeout, Math: Object.create(Math, { random: { value: random } }),
+        process, console, setTimeout: global.setTimeout, AbortController, Math: Object.create(Math, { random: { value: random } }),
         Date: skipWaits ? TestClock : Date
     });
-    return { handlers, logs, stateFolder, openedLogs, closed: () => closed };
+    return { handlers, logs, stateFolder, openedLogs, closed: () => closed,
+        quit: () => electron.app.quit(), quitCount: () => quitCount };
 }
 
 test('oldest deletion ignores navigation/profile menus and waits for sorted rows', async () => {
@@ -653,6 +661,31 @@ test('a Chrome cleanup failure preserves the original missing-editor error', asy
     assert.ok(main.logs.some(message => message.includes('Chrome cleanup: Test cleanup failed')));
     assert.equal(main.logs.some(message => message.includes('GHOST SESSION CLOSED')), false);
     assert.equal(state.posts, 0);
+});
+
+test('quitting during a recorded submission completes that item and Chrome cleanup before exiting', async () => {
+    state.drafts = 2;
+    let closing = false;
+    const main = mainProcess({ onLog: message => {
+        if (!closing && message.startsWith('Submission recorded:')) {
+            closing = true;
+            assert.equal(main.quit().prevented, true);
+            assert.equal(main.closed(), false);
+            assert.equal(main.quitCount(), 0);
+        }
+    } });
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true, loop: true });
+    await Promise.resolve();
+    assert.equal(closing, true);
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.equal(state.posts, 1);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.equal(main.closed(), true);
+    assert.equal(main.quitCount(), 1);
+    const history = JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json')));
+    assert.equal(history.submissions.length, 1);
+    assert.ok(history.cooldownUntil > Date.now());
 });
 
 test('scans full pages without recognizable pagination and indexes every draft', async () => {
