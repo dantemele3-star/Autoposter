@@ -87,6 +87,21 @@ original draft again instead of clicking its old row number. Newly appearing
 drafts are picked up in the next cycle. The log names the copy, Done, preview,
 and submission steps so a timeout identifies which step failed.
 
+Before submission, a transient navigation/editor timeout can retry the same
+source draft twice, after waits of 5 and 10 seconds. Recovery logs the detected
+page and controls, then reopens the source by ID even if rows moved. A preview
+that became ready after the timeout can continue without another copy. A draft
+that fails all three attempts is skipped for that cycle so other drafts can run.
+Three consecutive failures, or a cycle with no successful posts, pause the run
+instead of looping through a possible outage. Stop interrupts recovery waits.
+
+Recovery requires a recognized Gameflip page. Login prompts, browser checks,
+ambiguous source identities, access/rate-limit errors, and closed browsers still
+pause the run. After a submission is recorded, even a click error goes through
+read-only publication verification; it never retries List Item. Uncertain
+publications and deletion failures still pause rather than retrying a post or
+choosing another deletion target. The existing cooldown and daily cap apply.
+
 Initial Drafts navigation, scanning, and reopening use rendered list readiness
 instead of waiting for every background request to stop. Each scanned page must
 have stable identifiable rows (or an explicit empty-state message), no visible

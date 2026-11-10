@@ -5,10 +5,11 @@ const fs = require('fs');
 const os = require('os');
 
 const {
-    clickControl, waitForControl, advanceEditor, navigate, dismissPopup,
+    clickControl, navigate, dismissPopup,
     deleteOldestListing, capturePublication, waitForPublished
 } = require('./listing-controls');
-const { scanDrafts, openDraft } = require('./drafts');
+const { scanDrafts } = require('./drafts');
+const { prepareDraft } = require('./draft-preparation');
 const { PostingBudget, DAILY_LIMIT } = require('./posting-budget');
 const { RunLog, redact } = require('./run-log');
 const { version } = require('./package.json');
@@ -143,6 +144,7 @@ async function processDrafts(run, config, budget) {
             }
         }
 
+        let skipped = 0, consecutiveSkips = 0, lastPreparationError;
         for (let i = 0; i < processingQueue.length; i++) {
             if (shouldStop) {
                 log("\n🛑 Stop signal received. Ending session...");
@@ -154,27 +156,37 @@ async function processDrafts(run, config, budget) {
             log(`\n📦 Processing Item ${i + 1}/${processingQueue.length} (Scanned page ${item.page}, row ${item.index + 1})...`);
             log(`Source draft: ${item.key}`);
 
-            run.step('Opening the selected draft copy');
-            if (!await openDraft(page, item, log, () => shouldStop)) break;
-            await dismissPopup(page);
-            run.step('Waiting for Done in the draft editor');
-            await advanceEditor(page, { log });
-            await dismissPopup(page);
-            // Wait for the preview before capturing the new copy's ID.
-            run.step('Waiting for List Item in the listing preview');
-            const listReady = await waitForControl(page, 'list');
-            await listReady.dispose();
+            const preparation = await prepareDraft(page, item, {
+                log, step: label => run.step(label), stopped: () => shouldStop
+            });
+            if (preparation.status === 'stopped') break;
+            if (preparation.status === 'skipped') {
+                skipped++;
+                consecutiveSkips++;
+                lastPreparationError = preparation.error;
+                if (consecutiveSkips >= 3) {
+                    log('Three consecutive source drafts failed preparation; pausing instead of repeatedly retrying a possible site outage.');
+                    throw lastPreparationError;
+                }
+                continue;
+            }
+            consecutiveSkips = 0;
             let publication;
             let recorded = false;
             try {
                 run.step('Submitting the listing (confirmation can take up to 90 seconds)');
-                await clickControl(page, 'list', { beforeClick: async () => {
-                    publication = await capturePublication(page);
-                    const count = budget.reserve();
-                    recorded = true;
-                    log(`Submission recorded: ${count}/${DAILY_LIMIT} in the last 24 hours.`);
-                } });
-                log(`Submitted listing ID: ${publication.id || 'not available in the preview'}`);
+                try {
+                    await clickControl(page, 'list', { beforeClick: async () => {
+                        publication = await capturePublication(page);
+                        const count = budget.reserve();
+                        recorded = true;
+                        log(`Submission recorded: ${count}/${DAILY_LIMIT} in the last 24 hours.`);
+                    } });
+                } catch (error) {
+                    if (!recorded) throw error;
+                    log(`The submission click reported an error: ${error.message}. Checking the recorded publication without clicking List Item again.`);
+                }
+                log(`Submission target ID: ${publication.id || 'not available in the preview'}`);
                 run.step('Confirming publication in On Sale');
                 const publishedId = await waitForPublished(page, publication, { log });
                 postedCount++;
@@ -194,6 +206,8 @@ async function processDrafts(run, config, budget) {
 
         }
 
+        if (!shouldStop && skipped && !postedCount) throw lastPreparationError;
+        if (skipped) log(`Source drafts skipped before submission this cycle: ${skipped}.`);
         log(`\n--- 🏁 CYCLE FINISHED ---`);
         log(`Total successfully posted in this cycle: ${postedCount}`);
         return { success: true, postedCount };

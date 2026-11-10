@@ -12,6 +12,7 @@ const { ActionPacer, setPagePacer } = require('../pacing');
 const budgets = require('../posting-budget');
 const diagnostics = require('../run-log');
 const sessions = require('../chrome-session');
+const preparation = require('../draft-preparation');
 
 const OLD = '11111111-1111-4111-8111-111111111111';
 const RECENT = '22222222-2222-4222-8222-222222222222';
@@ -159,7 +160,8 @@ function fixture(url) {
                 <span class="tool-duplicate"><button onpointerdown="window.pressed=true"
                     onclick="if(window.pressed) location.href='/listings/${id}/edit'">Copy</button></span></div>`
             : `<a class="${state.decorativeCopyIcons ? '' : 'tool-duplicate'}" target="_blank" href="${state.sharedCopyLink ? '/listings/copy' : state.queryEditor ? `/listing/edit?id=${id}` : `/listings/${id}/edit` }"
-                ${state.blockCopy ? 'onclick="event.preventDefault()"' : ''}>${state.decorativeCopyIcons ? '<span class="tool-duplicate" aria-hidden="true">Copy</span>' : 'Create a copy in Draft'}</a>`).join('');
+                ${state.copyRedirect ? `onclick="event.preventDefault(); location.href='${state.copyRedirect}'"`
+                    : state.blockCopy || state.blockCopyId === id ? 'onclick="event.preventDefault()"' : ''}>${state.decorativeCopyIcons ? '<span class="tool-duplicate" aria-hidden="true">Copy</span>' : 'Create a copy in Draft'}</a>`).join('');
         if (state.pager === 'none') {
             content += '<section><button disabled>Next</button></section>';
         } else if (state.pager === 'buttons') {
@@ -199,7 +201,7 @@ function fixture(url) {
         const preview = state.queryEditor ? `/listing/preview?id=${id}` : `/listings/${id}/preview`;
         content = state.anchorDone
             ? `<a class="btn" href="${preview}">Done</a>`
-            : `<button onclick="location.href='${preview}'">Done</button>`;
+            : `<button onclick="${state.blockDone ? '' : `location.href='${preview}'`}">Done</button>`;
     } else if (url.pathname.endsWith('/preview')) {
         const prompt = state.postPopup === 'iframe'
             ? '<iframe id="notification-frame" src="https://notifications.example.test/notification-prompt" style="position:fixed;inset:10px;width:500px;height:300px"></iframe>'
@@ -294,7 +296,7 @@ function notificationPrompt(decline, custom = false) {
 }
 
 function mainProcess({ random = Math.random, skipWaits = false, stateFolder, launchError, closeError, clipboard,
-    publicationTimeoutMs = 5000, onLog = () => {} } = {}) {
+    publicationTimeoutMs = 5000, onLog = () => {}, submitClickError = false } = {}) {
     if (!stateFolder) {
         stateFolder = fs.mkdtempSync(path.join(os.tmpdir(), 'autoposter-state-test-'));
         stateFolders.push(stateFolder);
@@ -325,12 +327,17 @@ function mainProcess({ random = Math.random, skipWaits = false, stateFolder, lau
     };
     let clock = Date.now();
     class TestClock extends Date { static now() { return clock += 300000; } }
-    const testingControls = { ...controls, waitForPublished: (target, context, options) =>
+    const testingControls = { ...controls, clickControl: async (target, action, options) => {
+        await controls.clickControl(target, action, options);
+        if (action === 'list' && submitClickError) throw new Error('Execution context was destroyed after the submission click');
+    }, waitForPublished: (target, context, options) =>
         controls.waitForPublished(target, context, { ...options, timeoutMs: publicationTimeoutMs, retryDelayMs: 50 }) };
     vm.runInNewContext(fs.readFileSync(path.join(__dirname, '../main.js'), 'utf8'), {
         require: name => name === 'electron' ? electron : name === 'puppeteer'
             ? { launch: async () => { if (launchError) throw launchError; return fakeBrowser; } } : name === './listing-controls' ? testingControls
-                : name === './chrome-session' ? sessions : name === './drafts' ? drafts : name === './posting-budget' ? budgets
+                : name === './draft-preparation' ? { prepareDraft: (target, item, options) =>
+                    preparation.prepareDraft(target, item, { ...options, retryDelays: [0, 0] }) }
+                    : name === './chrome-session' ? sessions : name === './drafts' ? drafts : name === './posting-budget' ? budgets
                     : name === './run-log' ? diagnostics : name === './package.json' ? require('../package.json') : require(name),
         process, console, setTimeout: global.setTimeout, AbortController, Math: Object.create(Math, { random: { value: random } }),
         Date: skipWaits ? TestClock : Date
@@ -1096,7 +1103,112 @@ test('a copy action that stays on Drafts identifies the exact missing step', asy
     assert.match(result.error, /Done control in the draft editor on \/listings\/draft/);
     assert.equal(result.postedCount, 0);
     assert.equal(state.posts, 0);
+    assert.equal(main.logs.filter(message => message.startsWith('Retrying the same source draft')).length, 2);
 });
+
+test('an ignored Copy recovers the same source ID after rows move and submits only once', async () => {
+    state.blockCopy = true;
+    let beforeRetry;
+    const main = mainProcess({ onLog: message => {
+        if (message.startsWith('Retrying the same source draft')) {
+            beforeRetry = { posts: state.posts, historyExists: fs.existsSync(path.join(main.stateFolder, 'posting-history.json')) };
+            state.blockCopy = false;
+            state.draftPages = [[NEXT, NEW]];
+        }
+    } });
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.deepEqual(beforeRetry, { posts: 0, historyExists: false });
+    assert.deepEqual(state.published, [NEW]);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.ok(main.logs.some(message => /Recovery page state:.*"kind":"drafts"/.test(message)));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json'))).submissions.length, 1);
+});
+
+test('an editor stuck on Done reopens the same source and submits only the ready preview', async () => {
+    state.blockDone = true;
+    const main = mainProcess({ onLog: message => {
+        if (message.startsWith('Retrying the same source draft')) state.blockDone = false;
+    } });
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+    assert.equal(result.success, true, result.error);
+    assert.deepEqual(state.published, [NEW]);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.ok(main.logs.some(message => /Recovery page state:.*"kind":"editor"/.test(message)));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json'))).submissions.length, 1);
+});
+
+test('a repeatedly stuck source is skipped and the next source still posts', async () => {
+    state.drafts = 2;
+    state.blockCopyId = NEW;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+    assert.equal(result.success, true, result.error);
+    assert.equal(result.postedCount, 1);
+    assert.deepEqual(state.published, [NEXT]);
+    assert.deepEqual(state.deleted, [OLD]);
+    assert.equal(main.logs.filter(message => message.startsWith('Retrying the same source draft')).length, 2);
+    assert.ok(main.logs.some(message => message.includes(`Skipping source draft ${NEW}`)));
+    assert.equal(JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json'))).submissions.length, 1);
+});
+
+test('three consecutive preparation failures pause before trying another source', async () => {
+    state.draftPages = [sourceIds(0x78000000, 4)];
+    state.blockCopy = true;
+    const main = mainProcess();
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, false);
+    assert.equal(result.postedCount, 0);
+    assert.equal(state.posts, 0);
+    assert.equal(main.logs.filter(message => message.startsWith('Skipping source draft')).length, 3);
+    assert.equal(main.logs.filter(message => message.startsWith('Source draft:')).length, 3);
+    assert.equal(fs.existsSync(path.join(main.stateFolder, 'posting-history.json')), false);
+});
+
+test('Stop during recovery cancels reopening the draft without reserving a submission', async () => {
+    state.blockCopy = true;
+    const main = mainProcess({ onLog: message => {
+        if (message.startsWith('Retrying the same source draft')) void main.handlers.get('stop-drafts')();
+    } });
+    const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+    assert.equal(result.success, true, result.error);
+    assert.equal(state.posts, 0);
+    assert.equal(main.logs.filter(message => message.startsWith('Reopening draft page')).length, 1);
+    assert.equal(fs.existsSync(path.join(main.stateFolder, 'posting-history.json')), false);
+    assert.equal(main.closed(), true);
+});
+
+for (const destination of ['/listings/onsale', '/login']) {
+    test(`a copy redirected to ${destination} cannot be mistaken for the listing preview`, async () => {
+        state.copyRedirect = destination;
+        state.saleListButton = true;
+        const main = mainProcess();
+        const result = await main.handlers.get('process-drafts')({ sender: {} }, {});
+        assert.equal(result.success, false);
+        assert.equal(state.posts, 0);
+        assert.deepEqual(state.deleted, []);
+        assert.equal(main.logs.some(message => message.startsWith('Retrying the same source draft')), false);
+        assert.equal(fs.existsSync(path.join(main.stateFolder, 'posting-history.json')), false);
+    });
+}
+
+for (const rejected of [false, true]) {
+    test(`a click error after reservation verifies read-only without submitting twice (rejected=${rejected})`, async () => {
+        state.rejectPost = rejected;
+        const main = mainProcess({ submitClickError: true });
+        const result = await main.handlers.get('process-drafts')({ sender: {} }, { maintainLimit: true });
+        assert.equal(result.success, !rejected, result.error);
+        assert.equal(result.postedCount, rejected ? 0 : 1);
+        assert.equal(state.posts, rejected ? 0 : 1);
+        assert.equal(state.visits.filter(value => value === '/fixture/publish').length, 1);
+        assert.deepEqual(state.deleted, rejected ? [] : [OLD]);
+        assert.equal(main.logs.some(message => message.startsWith('Retrying the same source draft')), false);
+        const history = JSON.parse(fs.readFileSync(path.join(main.stateFolder, 'posting-history.json')));
+        assert.equal(history.submissions.length, 1);
+        assert.ok(history.cooldownUntil > Date.now());
+    });
+}
 
 test('recognizes On Sale despite its List Item button and reads the copied ID from query parameters', async () => {
     state.queryEditor = true;
